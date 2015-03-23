@@ -91,8 +91,10 @@
 #include <deal.II/dofs/dof_renumbering.h>
 
 #include "/home/afonsoal/Documents/dealii_8_2_1_unzipped/dealii-8.2.1/my_programs/my_includes/cut_cell_integration.h"
-#include "/home/afonsoal/Documents/dealii_8_2_1_unzipped/dealii-8.2.1/my_programs/my_includes/NewCell.h"
+//#include "/home/afonsoal/Documents/dealii_8_2_1_unzipped/dealii-8.2.1/my_programs/my_includes/NewCell.h"
 #include "/home/afonsoal/Documents/dealii_8_2_1_unzipped/dealii-8.2.1/my_programs/my_includes/NewMesh.h"
+
+#include "/home/afonsoal/Documents/dealii_8_2_1_unzipped/dealii-8.2.1/my_programs/NewCell.h"
 
 #include <deal.II/fe/fe_system.h>
 #include <deal.II/fe/fe_nothing.h>
@@ -314,6 +316,9 @@ public:
 	PoissonProblem (int _n_cycles);
 	void run ();
 	void run_PureNeumannProblem();
+	void run_PureNeumannProblemWithoutConstraint();
+	void run_CoupledReaction();
+
 
 private:
 	enum
@@ -328,6 +333,7 @@ private:
 		inside_block = 1
 	};
 
+//	double k_reaction;
 
 	int ExtendedGlobal2Local (int,const typename hp::DoFHandler<dim>::cell_iterator &cell);
 	static bool	cell_is_in_bulk_domain (const typename hp::DoFHandler<dim>::cell_iterator &cell);
@@ -345,9 +351,16 @@ private:
 	void assemble_system_newMesh ();
 	void solve ();
 	void output_results () const;
-	void process_solution_ubulk();
-	void interpolate_solution_usurface();
 
+	void make_grid_interpolated();
+
+	void interpolate_solution_usurface();
+	void CompInterpolatedBulkSolution(Vector<double> &old_solution_n_1);
+	void output_UbulkInterpolatedResults(Vector<double> &average_solution_ubulk);
+	void CompMassConservation ();
+	void CompMassConservationAlternative ();
+	void CompMassConservationAlternative_2 ();
+	void SetInitialCondition();
 	int 				 cycle;
 	int 				 n_cycles;
 	Triangulation<2>     triangulation;
@@ -357,7 +370,7 @@ private:
 	FE_Q<dim>            fe_q_inside;
 
 	FE_Q<2>              fe_justForMesh;
-	FE_Q<1,2>				fe_dummy;
+
 	hp::FECollection<dim> fe_collection_surface;
 	DoFHandler<2>        dof_handler;
 	hp::DoFHandler<2>        dof_handler_new;
@@ -433,15 +446,37 @@ private:
 //	SparseMatrix<double> mass_matrix;
 	FullMatrix<double> mass_matrix;
 	FullMatrix<double> FM_mass_matrix;
+	FullMatrix<double> FM_mass_matrix_with_k_reaction;
+//	FullMatrix<double> FM_kc_matrix_with_k_reaction;
+	Vector<double>	rhs_kc_usurface;
+	FullMatrix<double> j_matrix_us_ready;
 
 	// Solve pure Neumann problem matrices
 	Vector<double>		solution_block11_w_constraint;
 	FullMatrix<double>			FM_block_11_w_j_w_constraint_neumann;
 	Vector<double>		system_rhs_block11_w_constraint;
 
+	// Time dependent parameters.
 	double				theta;
 	double 				time_step;
 	int 				timestep_number;
+	double				final_time;
+	int 				n_time_steps;
+	FullMatrix<double> 	mass_conservation;
+	FullMatrix<double> 	mass_conservation_usurface;
+	FullMatrix<double> 	mass_conservation_ubulk;
+	double 				maximum_cell_integration;
+
+
+	const double 				k_reaction_quarter_2;
+	double 				diffusion_constant;
+	std::vector<NewCell> CutTriangulation;
+
+	// Objects for interpolated USURFACE solution in new boundary grid (levelset)
+	Triangulation<1,2> levelset_triangulation;
+	FE_Q<1,2>				fe_dummy;
+	DoFHandler<1,2>      dof_handler_us_interpol;
+
 };
 
 template <int dim>
@@ -454,14 +489,17 @@ fe_inside  (FE_Nothing<dim>() /*u_surface, @ inside */, 1, FE_Q<dim>(1),/*u_bulk
 fe_q_inside (1),
 
     fe_justForMesh (1),
-    fe_dummy (1),
+
 dof_handler ()
 , dof_handler_new (triangulation_new),
 new_n_cycles(_n_cycles)
 ,theta(0.5)
 ,time_step(1. / 250) // 1/500
 
-//dof_handler (triangulation) // use original
+,k_reaction_quarter_2(/*3*//*2.0*/0.0) // reaction constant, assuming r_A = -k*u_A ; r_B = k*u_A
+,diffusion_constant(/*0.*/1.0)	// Diffusion constant
+,fe_dummy (1)
+,dof_handler_us_interpol(levelset_triangulation)
 
 {
 	fe_collection_surface.push_back (fe_surface); // fe_index = 0
@@ -706,6 +744,7 @@ void PoissonProblem<dim>::get_new_triangulation ()
 	GridOut grid_out;
 	grid_out.write_eps (triangulation_new, out);
 	std::cout << "New Triangulation created: triangulation_new \n";
+
 }
 
 template <int dim>
@@ -901,6 +940,8 @@ void PoissonProblem<dim>::setup_system_new (){
 //		mass_matrix.reinit(sparsity_pattern_new);
 		mass_matrix.reinit(dof_handler_new.n_dofs(),dof_handler_new.n_dofs());
 		FM_mass_matrix.reinit(dof_handler_new.n_dofs(),dof_handler_new.n_dofs());
+		FM_mass_matrix_with_k_reaction.reinit(dof_handler_new.n_dofs(),dof_handler_new.n_dofs());
+//		FM_kc_matrix_with_k_reaction.reinit(dof_handler_new.n_dofs(),dof_handler_new.n_dofs());
 
 //		old_solution.reinit (dof_handler_new.n_dofs());
 
@@ -922,6 +963,10 @@ void PoissonProblem<dim>::initialize_levelset_new() {
 template <int dim>
 void PoissonProblem<dim>::assemble_system_newMesh ()
 {
+
+	std::vector<double> k_reaction_key; // j_face_vector_global_dofs
+	std::vector<Point<2> > k_reaction_coordinates; // j_face_vector_us
+
 	QGauss<dim>  quadrature_formula(2);
 	QGauss<1> face_quadrature_formula(2);
 
@@ -968,6 +1013,7 @@ void PoissonProblem<dim>::assemble_system_newMesh ()
 
 	FullMatrix<double>   cell_matrix /*(dofs_per_cell, dofs_per_cell)*/;
 	FullMatrix<double>   cell_mass_matrix/*(dofs_per_cell, dofs_per_cell)*/;
+	FullMatrix<double> 	 cell_mass_matrix_with_k_reaction;
 	Vector<double>       cell_rhs /*(dofs_per_cell)*/;
 	FullMatrix<double>   cell_j_matrix_us /*(dofs_per_cell+4 // 2 here, dofs_per_cell+4)*/;
 	FullMatrix<double>   cell_j_matrix_ub /*(dofs_per_cell+4, dofs_per_cell+4)*/;
@@ -1026,8 +1072,8 @@ void PoissonProblem<dim>::assemble_system_newMesh ()
 	double cell_diameter;
 	// Parameter alfa = gamma_D*h⁻1 (Refer to Burman (2012) and Mendez (2004))
 	const double gamma_D = 5;
-	const double gamma_N = /*.1*/0;  // parameter referring to the Neumann b.c., present on LHS and RHS terms
-	const double g_N = /*2*/0; // value of Neumann boundary (n*div(u) = g_N on boundary lambda_N)
+	const double gamma_N = /*.1*/1;  // parameter referring to the Neumann b.c., present on LHS and RHS terms
+	const double g_N = /*1*/0; // value of Neumann boundary (n*div(u) = g_N on boundary lambda_N)
 
 	double fs;
 	// From Burman et al 2014 (Cut FEM...)
@@ -1036,13 +1082,18 @@ void PoissonProblem<dim>::assemble_system_newMesh ()
 	std::cout << "Gamma_1 = " << gamma_1 << "\n";
 	const double gamma_p = /*.01;*/   0.1; // multiplier of stab. term of ubulk
 	// Coupling constants.
-	const double b_B = 1 ;
-	const double b_S = 1 ;
-	const double k_B = 1 ;
-	const double k_S = 1 ;
+	const double b_B = 1.0 ;
+	const double b_S = 1.0 ;
+	const double k_B = 1.0 ;
+	const double k_S = 1.0 ;
 
-	double g_D = 0; // Value of Dirichlet boundary
-	const double f_B = /*-2*/1;
+	double k_reaction;
+
+	double g_D = 0.0; // Value of Dirichlet boundary
+	/*const*/ double f_B /*= -2*//*1*/;
+	double f_B_pulse = 0.0/*0*/;
+	double radius_pulse = 0.4;
+
 	std::vector<types::global_dof_index> ::const_iterator first;
 	std::vector<types::global_dof_index> ::const_iterator last;
 	int count_u = 0, count_p = 0;
@@ -1060,12 +1111,18 @@ void PoissonProblem<dim>::assemble_system_newMesh ()
 	constraint_vector.block(1).reinit (n_dofs_inside);
 	constraint_vector.collect_sizes ();
 
-	hp::DoFHandler<2>::active_cell_iterator
-	cell = dof_handler_new.begin_active(),
-	endc = dof_handler_new.end();
+
 	WeightSolutionUbulk<dim> extract_weight_exact_solution;
 	ExactSolutionUbulk<dim> extract_exact_solutionUbulk;
 	ExactSolutionUsurface<dim> extract_exact_solutionUsurface;
+
+	// Create avector of Objects NewCell, used to retrieve info about cut cells, such as points of
+	// intersection, normal vector, length, etc.
+	CutTriangulation.reserve(triangulation_new.n_cells());
+
+	hp::DoFHandler<2>::active_cell_iterator
+	cell = dof_handler_new.begin_active(),
+	endc = dof_handler_new.end();
 	for (; cell!=endc; ++cell)
 	{
 		// Output to a all_points_vector all the points (nodes) of the new mesh, to vis. in Gnuplot
@@ -1097,12 +1154,12 @@ void PoissonProblem<dim>::assemble_system_newMesh ()
 
 		cell_matrix.reinit (dofs_per_cell,dofs_per_cell);
 		cell_mass_matrix.reinit (dofs_per_cell,dofs_per_cell);
+		cell_mass_matrix_with_k_reaction.reinit (dofs_per_cell,dofs_per_cell);
 		cell_matrix = 0;
 		cell_rhs.reinit (dofs_per_cell);
 		cell_rhs = 0;
 
 		int active_fe_index = cell->active_fe_index();
-
 
 		// Assemble matrix inside using the usual FE formulation.
 		if (cell_is_in_bulk_domain(cell))	{
@@ -1118,19 +1175,39 @@ void PoissonProblem<dim>::assemble_system_newMesh ()
 						cell_matrix(i,j) += (fe_values.shape_grad(i, q_point) *
 								fe_values.shape_grad(j, q_point) *
 								fe_values.JxW (q_point));
+						double mass_matrix_entry =fe_values.shape_value(i,q_point)
+														*fe_values.shape_value(j,q_point)
+														*fe_values.JxW (q_point);
+						cell_mass_matrix(i,j) += mass_matrix_entry;
+						// No reaction actually in the bulk domain
+						cell_mass_matrix_with_k_reaction(i,j) += 0;
 
-						cell_mass_matrix(i,j) += fe_values.shape_value(i,q_point)
-												*fe_values.shape_value(j,q_point)
-												*fe_values.JxW (q_point);
-					}
+					}// End for j
+					Point<2> P = support_points[cell_global_dof_indices_ALL[i]];
+					// Apply a constant "pulse" in the middle of the domain (radius <=0.3)
+					// In the rest, f_B = 0.
+					if ( P.square() <= radius_pulse )
+						f_B = f_B_pulse;
+					else f_B = 0;
 					cell_rhs(i) += (fe_values.shape_value (i, q_point) *
 							f_B * fe_values.JxW (q_point));
 					unsigned int j = cell_global_dof_indices_ALL[i];
 					exact_solution_ubulk[j-n_dofs_surface] =  extract_exact_solutionUbulk.value(support_points[j])
 //						 *extract_weight_exact_solution.value(support_points[j])
 						 ;
-				}
-			}
+				} //End for i
+			}// End for q_point
+			// NEW-> Try to enforce constraints in the form:
+			// sum_{all elements} \int_{\omega*u} = 10 000 (initial value that will diffuse over domain)
+//			for (unsigned int i=0; i<dofs_per_cell; ++i)
+//				for (unsigned int q_index=0; q_index<n_q_points; ++q_index)
+//					constraint_vector(local_dof_indices[i]) +=
+//							fe_values.shape_value(i,q_index)*fe_values.JxW (q_index);
+
+			NewCell ObjNewCell_new;
+			ObjNewCell_new.is_surface_cell = false;
+			ObjNewCell_new.SetIndex(cell);
+			CutTriangulation.push_back(ObjNewCell_new);
 		}
 
 		// Assemble terms on the surface domain.
@@ -1180,7 +1257,8 @@ void PoissonProblem<dim>::assemble_system_newMesh ()
 		// https://groups.google.com/forum/#!searchin/dealii/remove$20cells/dealii/0y93BHXL10M/840shoGzMP8J
 		// If I understand you correctly, it is sufficient for you to get the support points of the dofs.
 		// For this you can use a quadrature formula that is initialized with
-		// fe.get_unit_support_points. Then use a FEValues object that updates the quadrature points
+		// fe.get_unit_support_points. (Or get_generalized_support_points?)
+		// Then use a FEValues object that updates the quadrature points
 		// and call get_quadrature_points on each cell. The output is a std::vector and the entries
 		// are the support points of the local dofs.
 		count_u = 0;
@@ -1198,6 +1276,7 @@ void PoissonProblem<dim>::assemble_system_newMesh ()
 
 		// Input the cell_diameter for the error calculation, see process_results
 		cell_diameter = cell->diameter();
+
 //		ALLERRORS_ubulk[cycle][3] = cell_diameter;
 //		ALLERRORS_usurface[cycle][3] = cell_diameter; // This is in class assemble_system
 
@@ -1215,7 +1294,7 @@ void PoissonProblem<dim>::assemble_system_newMesh ()
 		(fe_values,/*fe*/FE_Q<2>(1),quadrature_formula,face_quadrature_formula);
 
 			NewCell ObjNewCell_new(levelset);
-
+			ObjNewCell_new.is_surface_cell = true;
 			std::vector<Point<2> > new_face(2);
 
 			// Loop over faces, to identify faces
@@ -1285,9 +1364,11 @@ void PoissonProblem<dim>::assemble_system_newMesh ()
 					// the same two DOF's.
 					if (X0 != X1)
 					{
-						ObjNewCell_new.setCoordinates(integrate_face_check,X0,X1);
-						ObjNewCell_new.setVertices();
+//						std::cout << "integrate_face_check: " << integrate_face_check << std::endl;
+						ObjNewCell_new.setCoordinates(integrate_face_check,X0,X1,false);
+//						ObjNewCell_new.setVertices();
 						face_normal_vector = fe_face_values.normal_vector(0);
+						ObjNewCell_new.SetFaceNormal(face_normal_vector);
 
 						// The only faces that are relevant to the stabilization term for the
 						// usurface var. are these: the intersected faces.
@@ -1307,6 +1388,7 @@ void PoissonProblem<dim>::assemble_system_newMesh ()
 						// It is part of the mapping from the unit cell face/new cut face
 						// to the parametric line r(t)
 						double face_length = sqrt(dx*dx+dy*dy);
+						ObjNewCell_new.SetUnitFaceLength(face_length);
 						for (unsigned int dof_i=0; dof_i<dofs_per_cell; ++dof_i) {
 							for (unsigned int dof_j=0; dof_j<dofs_per_cell; ++dof_j) {
 								dof_index_i = dof_handler_new.get_fe()[active_fe_index].
@@ -1325,21 +1407,37 @@ void PoissonProblem<dim>::assemble_system_newMesh ()
 												face_normal_vector,
 												dof_index_i,dof_index_j, face_length);
 
-								cell_mass_matrix(dof_i,dof_j)+=
-										Obj_cut_cell_integration.mass_matrix
+								double mass_matrix_entry = Obj_cut_cell_integration.mass_matrix
 										(X0,X1,face_normal_vector,dof_index_i,
 												dof_index_j,face_length );
+								cell_mass_matrix(dof_i,dof_j)+= mass_matrix_entry;
+
+								// Reaction happening only on boundary faces.
+
+								cell_mass_matrix_with_k_reaction(dof_i,dof_j)+=0;
+
 								}
-							}
+							} //end for j
 							if (dof_handler_new.get_fe()[active_fe_index].
 									system_to_component_index(dof_i).first == 1 ) {
 								dof_index_i = dof_handler_new.get_fe()[active_fe_index].
 										system_to_component_index(dof_i).second;
-							cell_rhs(dof_i)+= f_B*
-									Obj_cut_cell_integration.return_rhs_face_integration
+								Point<2> P = support_points[cell_global_dof_indices_ALL[dof_i]];
+								// Apply a constant "pulse" in the middle of the domain (radius <=0.3)
+								// In the rest, f_B = 0.
+								if ( P.square() <= radius_pulse )
+									f_B = f_B_pulse;
+								else f_B = 0;
+								cell_rhs(dof_i)+= f_B*
+										Obj_cut_cell_integration.return_rhs_face_integration
 									(X0,X1,face_normal_vector, dof_index_i, face_length);
+
+//								constraint_vector[cell_global_dof_indices_ALL[dof_i]] +=
+//										Obj_cut_cell_integration.CompConstraintUbulk
+//										(X0,X1,face_normal_vector,dof_index_i,face_length );
+
 							}
-						}
+						} // end for i
 						integrate_face_check++;
 					}
 				}
@@ -1373,13 +1471,15 @@ void PoissonProblem<dim>::assemble_system_newMesh ()
 					inside_faces++; // Keep track of number of inside_faces.
 					X0 = support_points[k0];
 					X1 = support_points[k1];
-					ObjNewCell_new.setCoordinates(integrate_face_check,X0,X1);
-					ObjNewCell_new.setVertices();
+					ObjNewCell_new.setCoordinates(integrate_face_check,X0,X1,false);
+
+//					ObjNewCell_new.setVertices();
 					new_face_vector.push_back(X0);
 					new_face_vector.push_back(X1);
 					new_face_vector.push_back(VOID_POINT);
 
 					face_normal_vector = fe_face_values.normal_vector(1);
+					ObjNewCell_new.SetFaceNormal(face_normal_vector);
 
 					X0 = mapping.transform_real_to_unit_cell(cell,X0);
 					X1 = mapping.transform_real_to_unit_cell(cell,X1);
@@ -1389,6 +1489,7 @@ void PoissonProblem<dim>::assemble_system_newMesh ()
 					double dx = (X1[0] - X0[0]);
 
 					double face_length = sqrt(dx*dx+dy*dy);
+					ObjNewCell_new.SetUnitFaceLength(face_length);
 
 					for (unsigned int dof_i=0; dof_i<dofs_per_cell; ++dof_i) {
 						for (unsigned int dof_j=0; dof_j<dofs_per_cell; ++dof_j) {
@@ -1418,9 +1519,19 @@ void PoissonProblem<dim>::assemble_system_newMesh ()
 								system_to_component_index(dof_i).first == 1){
 							dof_index_i = dof_handler_new.get_fe()[active_fe_index].
 									system_to_component_index(dof_i).second;
+							Point<2> P = support_points[cell_global_dof_indices_ALL[dof_i]];
+							// Apply a constant "pulse" in the middle of the domain (radius <=0.3)
+							// In the rest, f_B = 0.
+							if ( P.square() <= radius_pulse )
+								f_B = f_B_pulse;
+							else f_B = 0;
 						cell_rhs(dof_i)+= f_B*
 								Obj_cut_cell_integration.return_rhs_face_integration
 								(X0,X1,face_normal_vector, dof_index_i, face_length);
+
+//						constraint_vector[cell_global_dof_indices_ALL[dof_i]] +=
+//								Obj_cut_cell_integration.CompConstraintUbulk
+//								(X0,X1,face_normal_vector,dof_index_i,face_length );
 						}
 					}
 					integrate_face_check++;
@@ -1770,7 +1881,7 @@ void PoissonProblem<dim>::assemble_system_newMesh ()
 												std::vector<int> EXTENDED_local_dof_K_neighbor_p;
 
 												// EXTENDED_local_dof_K_p = {1,3,5,7,-1,-1}
-												for (unsigned int i=1;i<dofs_per_cell/*/2*/; ++(++i)) {
+												for (unsigned int i=1;i<dofs_per_cell/*2*/; ++(++i)) {
 													EXTENDED_local_dof_K_p.push_back(i);
 												}
 												EXTENDED_local_dof_K_p.push_back(-1); 	// 4
@@ -1884,20 +1995,21 @@ void PoissonProblem<dim>::assemble_system_newMesh ()
 //			assert(calls_to_j == integrate_face_check);
 			assert(integrate_face_check >= 2);
 
-			//INTEGRATE NEW FACE (BOUNDARY)
+			//INTEGRATE NEW CUT FACE (BOUNDARY)
 			// Now, one must integrate the new face created by the boundary on the cell.
 			// The two intersection points found in the previous loops will create the
 			// new face with the following points:
 			Point<dim> X0;
 			Point<dim> X1;
-			Point<dim> X0_RealCell;
-			Point<dim> X1_RealCell;
 			Point<dim> face_normal_vector;
 
 			X0 = new_face[0];
 			X1 = new_face[1];
-			ObjNewCell_new.setCoordinates(integrate_face_check,X0,X1);
-			ObjNewCell_new.setVertices();
+//			std::cout << "integrate_face_check: " << integrate_face_check << std::endl;
+			ObjNewCell_new.setCoordinates(integrate_face_check,X0,X1,true);
+
+//			ObjNewCell_new.setVertices();
+
 			new_face_vector.push_back(X0);
 			new_face_vector.push_back(X1);
 
@@ -1905,24 +2017,40 @@ void PoissonProblem<dim>::assemble_system_newMesh ()
 			create_levelset_vector_map(levelset_face_map,X1);
 
 			new_face_vector.push_back(VOID_POINT);
-			face_normal_vector = ObjNewCell_new.getCutFaceNormal();
+//			face_normal_vector = ObjNewCell_new.getCutFaceNormal();
+			face_normal_vector = ObjNewCell_new.GetCutFaceNormal();
+
+			 // The cut faces were already set in this ObjNewCell; However, I want to be able to
+			// store and easily extract the points forming the Cut Face (the other points do not matter
+			// much). Also, they will be in the right order because I've already called the normal
+			// function, which corrects the order of the points.
+			ObjNewCell_new.SetCutFacePoints(X0,X1);
 			new_normal_vector.push_back(face_normal_vector);
 
 			// Note that the terms regarding the integration over the entire cell
 			// a = (grad phi_i, grad phi_j) and b = (f,phi_i) use the UNIT face_length (FIXED),
 			// whereas the terms of integration over the boundary uses the REAL real_face_length (fixed)
-			double real_face_length =
-					ObjNewCell_new.ObjNewFace[integrate_face_check].face_length;
+//			double real_face_length =
+//					ObjNewCell_new.ObjNewFace[integrate_face_check].face_length;
 
+			double real_face_length =
+								ObjNewCell_new.Obj_VectorNewFace[integrate_face_check].real_face_length;
+			ObjNewCell_new.SetCutFaceLength(real_face_length);
+
+			Point<dim> X0_RealCell;
+			Point<dim> X1_RealCell;
 			X0_RealCell = X0;
 			X1_RealCell = X1;
 			X0 = mapping.transform_real_to_unit_cell(cell,X0);
 			X1 = mapping.transform_real_to_unit_cell(cell,X1);
 
-			double face_length = ObjNewCell_new.distance(X0,X1);
-			for (unsigned int dof_i=0; dof_i<dofs_per_cell; ++dof_i) {
-				for (unsigned int dof_j=0; dof_j<dofs_per_cell; ++dof_j) {
+//			double face_length = ObjNewCell_new.distance(X0,X1);
+			double face_length = X0.distance(X1);
+			ObjNewCell_new.SetUnitFaceLength(face_length);
 
+			for (unsigned int dof_i=0; dof_i<dofs_per_cell; ++dof_i) {
+				// Integrate LHS terms (dof_i, j)
+				for (unsigned int dof_j=0; dof_j<dofs_per_cell; ++dof_j) {
 					dof_index_i = dof_handler_new.get_fe()[active_fe_index].
 							system_to_component_index(dof_i).second;
 					dof_index_j = dof_handler_new.get_fe()[active_fe_index].
@@ -1938,11 +2066,29 @@ void PoissonProblem<dim>::assemble_system_newMesh ()
 										face_normal_vector,
 										dof_index_i,dof_index_j, face_length);
 
-					cell_mass_matrix(dof_i,dof_j)+=
-							Obj_cut_cell_integration.mass_matrix
+						if( 	(X0_RealCell[0]<=0 && X1_RealCell[0]<=0)
+								&&
+								(X0_RealCell[1]<=0 && X1_RealCell[1]<=0) )
+							k_reaction = k_reaction_quarter_2;
+						else k_reaction = 0.0;
+
+						k_reaction_key.push_back(k_reaction);
+						k_reaction_coordinates.push_back(support_points[cell_global_dof_indices_ALL[dof_i]]);
+
+					double mass_matrix_entry = Obj_cut_cell_integration.mass_matrix
 							(X0,X1,face_normal_vector,dof_index_i,
 									dof_index_j,face_length );
-					}
+
+					cell_mass_matrix(dof_i,dof_j)+= mass_matrix_entry;
+
+					// Reaction happening only on the quarter 2 of the Domain.
+
+					cell_mass_matrix_with_k_reaction(dof_i,dof_j)+=k_reaction*
+							Obj_cut_cell_integration
+							.CompMassMatrixSurface(X0_RealCell, X1_RealCell,
+									dof_index_i,dof_index_j,real_face_length);
+
+					}// End index = 1 (ubulk)
 
 					// Integrate boundary term (L-B operator) : this is already inside
 					// only boundary cells.
@@ -1956,8 +2102,15 @@ void PoissonProblem<dim>::assemble_system_newMesh ()
 										dof_index_j,
 										real_face_length
 										);
-					}
-				} // End For dof_j
+						// For USURFACE equation, the reaction term appears on the RHS only.
+						// It is assembled in the CompInterpolatedBulkSolution() function.
+						double mass_matrix_entry = Obj_cut_cell_integration.CompMassMatrixSurface
+								(X0, X1, dof_index_i,dof_index_j,real_face_length);
+
+						cell_mass_matrix(dof_i,dof_j)+= mass_matrix_entry;
+					}// End index = 0 (usurface)
+				}  // End For dof_j
+				// Integrate RHS terms (only dof_i)
 				// Integrate COUPLING term // moved from here
 				// Integrate RHS bulk term
 				if (dof_handler_new.get_fe()[active_fe_index].
@@ -1965,36 +2118,37 @@ void PoissonProblem<dim>::assemble_system_newMesh ()
 				{
 					dof_index_i = dof_handler_new.get_fe()[active_fe_index].
 							system_to_component_index(dof_i).second;
+					Point<2> P = support_points[cell_global_dof_indices_ALL[dof_i]];
+					// Apply a constant "pulse" in the middle of the domain (radius <=0.3)
+					// In the rest, f_B = 0.
+					if ( P.square() <= radius_pulse )
+						f_B = f_B_pulse;
+					else f_B = 0;
 					cell_rhs(dof_i)+= f_B*
 							Obj_cut_cell_integration.return_rhs_face_integration
-							(X0,X1,face_normal_vector, dof_index_i, face_length)
+							(X0,X1,face_normal_vector, dof_index_i, face_length);
+
+//					constraint_vector[cell_global_dof_indices_ALL[dof_i]] +=
+//							Obj_cut_cell_integration.CompConstraintUbulk
+//							(X0,X1,face_normal_vector,dof_index_i,face_length );
 
 							// Applying different Dirichlet Constants over the boundary.
 							// The next Idea is to apply reaction instead of g_D = 0, and
 							// Neumann instead of g_D = 1.
 							// (If g_D = 0, this doesn't change anything actually...)
 							;
-/*					if ( ((X0_RealCell[0]>=0 && X1_RealCell[0]>=0) && (X0_RealCell[1]>=0 && X1_RealCell[1]>=0))
-							||
-							((X0_RealCell[0]<=0 && X1_RealCell[0]<=0) && (X0_RealCell[1]>=0 && X1_RealCell[1]>=0))
-							||
-							((X0_RealCell[0]>=0 && X1_RealCell[0]>=0) && (X0_RealCell[1]<=0 && X1_RealCell[1]<=0))
-					)
+					/*if( some function to set the region )
 								g_D = 1;
 							else g_D = 0;*/
+					// g_D = 0, so this is null
+//								cell_rhs(dof_i)+=		Obj_cut_cell_integration.getTermD2
+//							(X0, X1, face_normal_vector,
+//									dof_index_i, alfa, g_D, real_face_length );
 
-								cell_rhs(dof_i)+=		Obj_cut_cell_integration.getTermD2
-							(X0, X1, face_normal_vector,
-									dof_index_i, alfa, g_D, real_face_length );
-
-					// Neumann term RHS, only quarters 0,1,3
-
-					if ( ((X0_RealCell[0]>=0 && X1_RealCell[0]>=0) && (X0_RealCell[1]>=0 && X1_RealCell[1]>=0))
-							||
-							((X0_RealCell[0]<=0 && X1_RealCell[0]<=0) && (X0_RealCell[1]>=0 && X1_RealCell[1]>=0))
-							||
-							((X0_RealCell[0]>=0 && X1_RealCell[0]>=0) && (X0_RealCell[1]<=0 && X1_RealCell[1]<=0))
-					)
+					// Applying different Neumann B.C. along the boundary.
+					// Neumann term RHS, ALL BOUNDARY
+					/*if( some function to set the region ) */
+							// This is equal to 0 if g_N = 0
 						cell_rhs(dof_i)+=	Obj_cut_cell_integration.getTermN2(X0, X1,
 											face_normal_vector,	dof_index_i, g_N,
 											real_face_length, gamma_N, cell_diameter);
@@ -2009,7 +2163,7 @@ void PoissonProblem<dim>::assemble_system_newMesh ()
 							(X0,X1, dof_index_i,
 									real_face_length
 							);
-				}
+				} // End index = 1 (ubulk)
 				// Integrate RHS boundary term (L-B operator)
 				if (dof_handler_new.get_fe()[active_fe_index].
 						system_to_component_index(dof_i).first == 0) {
@@ -2017,22 +2171,27 @@ void PoissonProblem<dim>::assemble_system_newMesh ()
 							system_to_component_index(dof_i).second;
 //					 original: fs = 108*sin...
 //					fs = 108*sin(3*atan2
-					fs = 108/12*sin(3*atan2
-							(support_points[cell_global_dof_indices_ubulk[dof_index_i]][1],
-									support_points[cell_global_dof_indices_ubulk[dof_index_i]][0]));
+//					fs = 108/12*sin(3*atan2
+//							(support_points[cell_global_dof_indices_ubulk[dof_index_i]][1],
+//									support_points[cell_global_dof_indices_ubulk[dof_index_i]][0]));
+					if( 	(X0_RealCell[0]<=0 && X1_RealCell[0]<=0)
+							&&
+							(X0_RealCell[1]<=0 && X1_RealCell[1]<=0) )
+						fs = 0/*0*/;
+					else fs = 0;
+
 					cell_rhs(dof_i)+=
 							b_S*Obj_cut_cell_integration.getTermBeltramiBoundaryRHS
 							(X0,X1,dof_index_i,
 									real_face_length
 									, fs);
-
-					constraint_vector (cell_global_dof_indices_ALL[dof_i])+=
-							Obj_cut_cell_integration.constraintVector
-							(X0,X1, dof_index_i,
-//									face_length
-									real_face_length
-									);
-				}
+					// Constraint to the USURFACE equation.
+//					constraint_vector (cell_global_dof_indices_ALL[dof_i])+=
+//							Obj_cut_cell_integration.constraintVector
+//							(X0,X1, dof_index_i,
+//									real_face_length
+//									);
+				} // End index = 0 (usurface)
 			}  // End For dof_i
 
 			// Integrate COUPLING term // moved to here
@@ -2088,16 +2247,13 @@ void PoissonProblem<dim>::assemble_system_newMesh ()
 			// To apply Neumann B.C. on the bulk equation, One must enforce constraints
 			// (see my_programs/step-11_vAfonso)
 			// These constraints are not enforced here. (Merely the constraints for the surface problem)
-			// Neumann term
+			// Neumann term LHS
 			// Neumann Term - if gamma_N = 0, does not evaluate
 			if (1)
-			// Apply Neumann B.C in the 0,1,3 quarters:
-				if ( ((X0_RealCell[0]>=0 && X1_RealCell[0]>=0) && (X0_RealCell[1]>=0 && X1_RealCell[1]>=0))
-						||
-						((X0_RealCell[0]<=0 && X1_RealCell[0]<=0) && (X0_RealCell[1]>=0 && X1_RealCell[1]>=0))
-						||
-						((X0_RealCell[0]>=0 && X1_RealCell[0]>=0) && (X0_RealCell[1]<=0 && X1_RealCell[1]<=0))
-				)
+				// Actually, apply Neumann B.C. in all the boundary for the Ubulk solution;
+				// this simulates a no flux boundary (g_N = 0)
+				/*if( some function to set the region ) */
+
 				for (unsigned int dof_i=0; dof_i<dofs_per_cell; ++dof_i) {
 					for (unsigned int dof_j=0; dof_j<dofs_per_cell; ++dof_j) {
 						dof_index_i = dof_handler_new.get_fe()[active_fe_index].
@@ -2120,13 +2276,8 @@ void PoissonProblem<dim>::assemble_system_newMesh ()
 		// Abort these terms for the evaluation of coupled system (these terms do not appear
 		// on "Cut FEM... Burman et al 2014")
 		// TERM C (Burman, Hansbo 2012 - Fictitious...) (C and D refer to the Dirichlet Boundary)
-			// Apply Dirichlet B.C. in quarter 2: of the domain
-					if (! ((X0_RealCell[0]>=0 && X1_RealCell[0]>=0) && (X0_RealCell[1]>=0 && X1_RealCell[1]>=0))
-							||
-							((X0_RealCell[0]<=0 && X1_RealCell[0]<=0) && (X0_RealCell[1]>=0 && X1_RealCell[1]>=0))
-							||
-							((X0_RealCell[0]>=0 && X1_RealCell[0]>=0) && (X0_RealCell[1]<=0 && X1_RealCell[1]<=0))
-					)
+			if (0)
+				/*if( some function to set the region ) */
 			{
 				for (unsigned int dof_i=0; dof_i<dofs_per_cell; ++dof_i) {
 					for (unsigned int dof_j=0; dof_j<dofs_per_cell; ++dof_j) {
@@ -2193,6 +2344,9 @@ void PoissonProblem<dim>::assemble_system_newMesh ()
 						 ;
 					}
 			}
+			ObjNewCell_new.SetIndex(cell);
+
+			CutTriangulation.push_back(ObjNewCell_new);
 		} // End if (cell_is_in_surface_domain (isboundary))
 		cell->get_dof_indices (local_dof_indices);
 		// local_dof_indices is the vector with the global dof indices associated with this cell.
@@ -2208,8 +2362,14 @@ void PoissonProblem<dim>::assemble_system_newMesh ()
 					for (unsigned int j=0; j<dofs_per_cell; ++j)
 						mass_matrix.add (local_dof_indices[i],
 								local_dof_indices[j],
-								cell_mass_matrix(i,j)
-						);
+								cell_mass_matrix(i,j));
+
+		for (unsigned int i=0; i<dofs_per_cell; ++i)
+			for (unsigned int j=0; j<dofs_per_cell; ++j)
+				FM_mass_matrix_with_k_reaction.add (local_dof_indices[i],
+						local_dof_indices[j],cell_mass_matrix_with_k_reaction(i,j));
+
+
 		count_cell++;
 	} // (end for cell)
 
@@ -2335,7 +2495,7 @@ void PoissonProblem<dim>::assemble_system_newMesh ()
 	system_rhs_block11_w_constraint.reinit(n_dofs_inside+1);
 	for(int unsigned i = 0; i < n_dofs_inside; ++i)
 		system_rhs_block11_w_constraint(i) = system_rhs_new.block(1)(i);
-	system_rhs_block11_w_constraint(n_dofs_inside) = 0;
+	system_rhs_block11_w_constraint(n_dofs_inside) = /*40 000.0*/ 156.25; // Experiment
 
 	FM_block_11_w_j_w_constraint_neumann.reinit(n_dofs_inside+1,n_dofs_inside+1);
 	for(int unsigned i = 0; i < n_dofs_inside; ++i) {
@@ -2394,7 +2554,7 @@ void PoissonProblem<dim>::assemble_system_newMesh ()
 	FullMatrix<double> IFM_system_matrix;
 
 	// Calculate the Condition Number of the ENTIRE matrix, with constraint and without (both with J)
-	if (1) {
+	if (0) {
 	IFM_system_matrix.copy_from(FM_system_matrix_block_w_constraint);
 //	IFM_system_matrix.copy_from(FM_system_matrix_block_yes_j_no_constraint);
 	condition_number = IFM_system_matrix.l1_norm()*FM_system_matrix_block_w_constraint.l1_norm();
@@ -2457,7 +2617,7 @@ void PoissonProblem<dim>::assemble_system_newMesh ()
 
 	FM_mass_matrix.copy_from(mass_matrix);
 
-	// Input block j_matrix_ub in mass_matrix elements related to ubulk.
+	// Input block j_matrix_ub in FM_mass_matrix elements related to ubulk.
 	for(int unsigned i = 0; i < n_dofs_inside; ++i) {
 		for(int unsigned j = 0; j < n_dofs_inside; ++j) {
 			FM_mass_matrix	(i+ n_dofs_surface,j+n_dofs_surface) +=
@@ -2465,12 +2625,57 @@ void PoissonProblem<dim>::assemble_system_newMesh ()
 		}
 	}
 
+	// Input block j_matrix_us in FM_mass_matrix elements related to USURFACE.
+	for(int unsigned i = 0; i < n_dofs_surface; ++i) {
+		for(int unsigned j = 0; j < n_dofs_surface; ++j) {
+			FM_mass_matrix	(i,j) +=
+					gamma_M*cell_diameter*cell_diameter*j_matrix_us(i,j);
+		}
+	}
 
+	// Input block j_matrix_ub in FM_mass_matrix_with_k_reaction elements related to ubulk.
+	for(int unsigned i = 0; i < n_dofs_inside; ++i) {
+		for(int unsigned j = 0; j < n_dofs_inside; ++j) {
+			FM_mass_matrix_with_k_reaction	(i+ n_dofs_surface,j+n_dofs_surface) +=
+					gamma_M*cell_diameter*cell_diameter*j_matrix_ub(i,j);
+		}
+	}
+
+	// Input block j_matrix_us in mass_matrix elements related to USURFACE.
+/*	for(int unsigned i = 0; i < n_dofs_surface; ++i) {
+		for(int unsigned j = 0; j < n_dofs_surface; ++j) {
+			FM_mass_matrix_with_k_reaction	(i,j) +=
+					gamma_M*cell_diameter*cell_diameter*j_matrix_us(i,j);
+		}
+	}*/
 
 	// Output matrices and vectors for visualization purposes only.
 	// Output also vectors used to create plots in Gnuplot
 	if(1) {
 
+
+		{
+//			Output the DOFS with the associated k_reaction
+			std::ofstream K_REACTION;
+//			j_faces = j_faces_usurface
+			K_REACTION.open("k_reaction.txt");
+
+			for(int unsigned j = 0; j <  k_reaction_coordinates.size(); ++j) {
+				// If you want to output the global DOF's to visualize them over the nodes, uncomment
+				// the lines below. Note that it will not be possible to "join" the points together
+				// in the output.
+				// plot 'j_faces.txt' w lp
+				// CHECKED: It is the same DOF structure as in PoissonProblem_stationary.
+
+
+				K_REACTION << k_reaction_key[j] << ' ';
+				for(int unsigned i = 0; i < 2; ++i) {
+					K_REACTION << k_reaction_coordinates[j](i) << ' ';
+				}
+				K_REACTION << std::endl;
+			}
+			K_REACTION.close();
+		}
 
 		// Output block 0,0 without stabilization.
 //		{
@@ -2645,16 +2850,16 @@ void PoissonProblem<dim>::assemble_system_newMesh ()
 //			}
 //			SYSTEM_RHS.close();
 //		}
-//		// Output system rhs block 1 without constraint.
-//		{
-//			std::ofstream SYSTEM_RHS;
-//			SYSTEM_RHS.open("system_rhs_block1_no_constraint.txt");
-//			for(int unsigned i = 0; i < system_rhs_block1.size(); ++i) {
-//				SYSTEM_RHS << system_rhs_block1(i);
-//				SYSTEM_RHS << std::endl;
-//			}
-//			SYSTEM_RHS.close();
-//		}
+		// Output system rhs block 1 without constraint.
+		{
+			std::ofstream SYSTEM_RHS;
+			SYSTEM_RHS.open("system_rhs_block1_no_constraint.txt");
+			for(int unsigned i = 0; i < system_rhs_block1.size(); ++i) {
+				SYSTEM_RHS << system_rhs_block1(i);
+				SYSTEM_RHS << std::endl;
+			}
+			SYSTEM_RHS.close();
+		}
 //
 //		// Output system rhs block 1 with constraint.
 //		{
@@ -2704,53 +2909,53 @@ void PoissonProblem<dim>::assemble_system_newMesh ()
 //		}
 //
 		// Start Output of vectors for visualization of relevant mesh in Gnuplot
-		{
-			// Save a .txt file with the coordinates of the faces relevant to the
-			// stabilization term (j_faces)
-			std::ofstream j_faces;
-//			j_faces = j_faces_usurface
-			j_faces.open("j_faces_usurface.txt");
-			for(int unsigned j = 0; j <  j_face_vector_us.size(); ++j) {
-				if (j_face_vector_us[j] == VOID_POINT) {
-					j_faces << std::endl;
-				}
-				else {
-					// If you want to output the global DOF's to visualize them over the nodes, uncomment
-					// the lines below. Note that it will not be possible to "join" the points together
-					// in the output.
-					// plot 'j_faces.txt' w lp
-					// CHECKED: It is the same DOF structure as in PoissonProblem_stationary.
-					/*if (j_face_vector_global_dofs[j] != VOID_INT)
-				j_faces << j_face_vector_global_dofs[j] << ' ';
-			else j_faces << ' '<< ' ';*/
-					for(int unsigned i = 0; i < 2; ++i) {
-						j_faces << j_face_vector_us[j](i) << ' ';
-					}
-					j_faces << std::endl;
-				}
-			}
-			j_faces.close();
-		}
+//		{
+//			// Save a .txt file with the coordinates of the faces relevant to the
+//			// stabilization term (j_faces)
+//			std::ofstream j_faces;
+////			j_faces = j_faces_usurface
+//			j_faces.open("j_faces_usurface.txt");
+//			for(int unsigned j = 0; j <  j_face_vector_us.size(); ++j) {
+//				if (j_face_vector_us[j] == VOID_POINT) {
+//					j_faces << std::endl;
+//				}
+//				else {
+//					// If you want to output the global DOF's to visualize them over the nodes, uncomment
+//					// the lines below. Note that it will not be possible to "join" the points together
+//					// in the output.
+//					// plot 'j_faces.txt' w lp
+//					// CHECKED: It is the same DOF structure as in PoissonProblem_stationary.
+//					/*if (j_face_vector_global_dofs[j] != VOID_INT)
+//				j_faces << j_face_vector_global_dofs[j] << ' ';
+//			else j_faces << ' '<< ' ';*/
+//					for(int unsigned i = 0; i < 2; ++i) {
+//						j_faces << j_face_vector_us[j](i) << ' ';
+//					}
+//					j_faces << std::endl;
+//				}
+//			}
+//			j_faces.close();
+//		}
 //		// Output "F_S,h, the set of internal faces (i.e., faces with two neighbors)" (Cut FEM Burman 14)
 //		// Visualize the set of faces submitted to stabilization over p (surface var.)
-		{
-			std::ofstream j_faces;
-//			j_matrix_ub = j_matrix_ubulk
-			j_faces.open("j_matrix_ubulk.txt");
-			for(int unsigned j = 0; j <  j_face_vector_ub.size(); ++j) {
-				if (j_face_vector_ub[j] == VOID_POINT) {
-					j_faces << std::endl;
-				}
-				else {
-					for(int unsigned i = 0; i < 2; ++i) {
-						j_faces << j_face_vector_ub[j](i) << ' ';
-					}
-					j_faces << std::endl;
-				}
-			}
-			j_faces.close();
-		}
-//
+//		{
+//			std::ofstream j_faces;
+////			j_matrix_ub = j_matrix_ubulk
+//			j_faces.open("j_matrix_ubulk.txt");
+//			for(int unsigned j = 0; j <  j_face_vector_ub.size(); ++j) {
+//				if (j_face_vector_ub[j] == VOID_POINT) {
+//					j_faces << std::endl;
+//				}
+//				else {
+//					for(int unsigned i = 0; i < 2; ++i) {
+//						j_faces << j_face_vector_ub[j](i) << ' ';
+//					}
+//					j_faces << std::endl;
+//				}
+//			}
+//			j_faces.close();
+//		}
+////
 //		{
 //			// Create a .txt file with ALL the points of the mesh
 //			std::ofstream all_points;
@@ -2772,25 +2977,24 @@ void PoissonProblem<dim>::assemble_system_newMesh ()
 //		/////
 //
 		// Create a .txt file with all the points of each (new) cut cell face
-		{
-			std::ofstream new_cut_face;
-			new_cut_face.open("new_cut_face.txt");
-			for(int unsigned j = 0; j < new_face_vector.size(); ++j) {
-				if (new_face_vector[j] == VOID_POINT) {
-					new_cut_face << std::endl;
-				}
-				else {
-					for(int unsigned i = 0; i < 2; ++i) {
-						new_cut_face << new_face_vector[j](i) << ' ';
-					}
-					new_cut_face << std::endl;
-				}
-			}
-			new_cut_face.close();
-		}
+//		{
+//			std::ofstream new_cut_face;
+//			new_cut_face.open("new_cut_face.txt");
+//			for(int unsigned j = 0; j < new_face_vector.size(); ++j) {
+//				if (new_face_vector[j] == VOID_POINT) {
+//					new_cut_face << std::endl;
+//				}
+//				else {
+//					for(int unsigned i = 0; i < 2; ++i) {
+//						new_cut_face << new_face_vector[j](i) << ' ';
+//					}
+//					new_cut_face << std::endl;
+//				}
+//			}
+//			new_cut_face.close();
+//		}
+
 	}
-
-
 }
 
 template <int dim>
@@ -2834,7 +3038,8 @@ void PoissonProblem<dim>::solve ()
 	}
 
 	// Solve full Matrix Time Dependent - PURE NEUMANN without constraint or Coupled problem
-	if (1) {
+
+	if (0) {
 	std::cout << "Solving full Stiffness matrix without constraint "
 			"with stabilization terms in U and P  \n";
 
@@ -2852,36 +3057,40 @@ void PoissonProblem<dim>::solve ()
 	}
 	}
 
-	// Solve full Matrix with constraint Pure NEUMANN (TIME DEPENDENT)
+//	run_PureNeumannProblem()
+	// Solve UBULK Matrix with constraint Pure NEUMANN (TIME DEPENDENT)
 	if (0) {
-	std::cout << "Solving full Stiffness matrix without constraint "
-			"with stabilization terms in U and P  \n";
+	std::cout << "Solving UBULK WITH constraint run_PureNeumannProblem\n";
 
-//	solver.solve (FM_system_matrix_block_yes_j_no_constraint, /*solution_block0*/
-//			solution_new, system_rhs_new,	PreconditionIdentity());
 	// If Pure Neumann...
-	solution.reinit(n_dofs_inside+1);
-	//
 	solver.solve (system_matrix_aux, solution, system_rhs_aux,
 				PreconditionIdentity());
 
-//	solver.solve (system_matrix_aux, solution, system_rhs_aux,
-//				PreconditionIdentity());
-
-	// Separate the solutions in U and P to output later. Eliminate the "mi" Lagrange Multiplier
-//	for(unsigned int i = 0; i < n_dofs_surface; ++i) {
-//		solution_new.block(0)(i) = solution(i);
-//		solution_block0(i) = solution(i);
-//	}
-
-//	for(unsigned int i = 0; i < n_dofs_inside; ++i) {
-//		solution_new.block(1)(i) = solution(i+n_dofs_surface);
-//	}
 	// If Pure Neumann...
 	for(unsigned int i = 0; i < n_dofs_inside; ++i) {
 		solution_new.block(1)(i) = solution(i);
 	}
 
+	std::cout << "LAGRANGE MULTIPLIER: "
+			<< solution_new(n_dofs_inside) << "\n";
+	}
+
+	// run_PureNeumannProblemWithoutConstraint
+	// Solve UBULK Matrix withOUT constraint Mixed NEUMANN (TIME DEPENDENT)
+	if (1) {
+		std::cout << "Solving UBULK Without Constraint run_PureNeumannProblemWithoutConstraint \n";
+
+//	solver.solve (FM_system_matrix_block_yes_j_no_constraint, /*solution_block0*/
+//			solution_new, system_rhs_new,	PreconditionIdentity());
+	// If Pure Neumann...
+	//
+	solver.solve (system_matrix_aux, solution, system_rhs_aux,
+				PreconditionIdentity());
+
+	// If Pure Ubulk problem...
+	for(unsigned int i = 0; i < n_dofs_inside; ++i) {
+		solution_new.block(1)(i) = solution(i);
+	}
 
 	}
 
@@ -3051,137 +3260,20 @@ void PoissonProblem<dim>::output_results () const
 		data_out_surface.build_patches ();
 
 
-		const std::string filename = "solution-"
+		const std::string filename = "solution_-"
 				+ Utilities::int_to_string(timestep_number, 3) +
 				".vtk";
 
 		std::ofstream output_new(filename.c_str());
 		data_out_surface.write_vtk(output_new);
 	}
-
-	// Output uncoupled exact solution
-    bool coupled = false;
-    if ( ! coupled ) {
-    {
-        std::vector<std::string> solution_names;
-        solution_names.push_back ("USURFACE_exact");
-        solution_names.push_back ("UBULK_exact");
-
-    	std::vector<DataComponentInterpretation::DataComponentInterpretation>
-    	data_component_interpretation
-    	(2, DataComponentInterpretation::component_is_scalar);
-
-    	DataOut<dim,hp::DoFHandler<dim> > data_out_surface;
-    	data_out_surface.attach_dof_handler (dof_handler_new);
-    	data_out_surface.add_data_vector (exact_solution, solution_names,
-    			DataOut<dim,hp::DoFHandler<dim> >::type_dof_data,
-    			data_component_interpretation);
-
-    	data_out_surface.build_patches ();
-    	std::string filename_new = "exact_solution-";
-    	filename_new += ('0' + new_n_cycles);
-    	filename_new += ".vtk";
-    	std::ofstream output_new(filename_new.c_str());
-    	data_out_surface.write_vtk(output_new);
-	}
-    // Output uncoupled difference solution.
-    {
-    	std::vector<std::string> solution_names;
-    	solution_names.push_back ("USURFACE_difference");
-    	solution_names.push_back ("UBULK_difference");
-
-    	std::vector<DataComponentInterpretation::DataComponentInterpretation>
-    	data_component_interpretation
-    	(2, DataComponentInterpretation::component_is_scalar);
-
-    	DataOut<dim,hp::DoFHandler<dim> > data_out_surface;
-    	data_out_surface.attach_dof_handler (dof_handler_new);
-    	data_out_surface.add_data_vector (difference_solution, solution_names,
-    			DataOut<dim,hp::DoFHandler<dim> >::type_dof_data,
-    			data_component_interpretation);
-
-    	//    	data_out_surface.add_data_vector (solution_block1, "USURFACE");
-    	data_out_surface.build_patches ();
-
-    	std::string filename_new = "difference_solution-";
-    	filename_new += ('0' + cycle);
-    	filename_new += ".vtk";
-    	std::ofstream output_new(filename_new.c_str());
-    	data_out_surface.write_vtk(output_new);
-    }
-    }
-
-
 }
 
 template <int dim>
-void PoissonProblem<dim>::process_solution_ubulk ()
-{
+void PoissonProblem<dim>::make_grid_interpolated(){
 
-	  const ComponentSelectFunction<dim>	usurface_mask (0, 2); // (component, # of components)
-	  const ComponentSelectFunction<dim>	ubulk_mask    (1, 2);
-
-	QGauss<dim>  quadrature_formula(3);
-
-    hp::QCollection<dim>  q_collection;
-    q_collection.push_back (quadrature_formula);
-    q_collection.push_back (quadrature_formula);
-
-	WeightSolutionUbulk<dim> weight_values;
-	// WeightSolutionUbulk takes care of eliminating the usurface vector from the computation.
-
-	const unsigned int n_active_cells = triangulation_new.n_active_cells();
-//	const unsigned int n_dofs 		  = dof_handler_new.n_dofs();
-
-	Vector<double> weight_integrate_difference(n_active_cells); // Vector initiliazed, all elements equal to zero.
-	ALLERRORS_ubulk[cycle][0] = cycle;
-	ALLERRORS_ubulk[cycle][1] = n_active_cells;
-	ALLERRORS_ubulk[cycle][2] = n_dofs_inside;
-	Vector<float> difference_per_cell (triangulation_new.n_active_cells());
-	VectorTools::integrate_difference(dof_handler_new,
-			solution_new,
-			ExactSolution<dim>(),
-			difference_per_cell,
-			q_collection,
-			VectorTools::L2_norm
-			,&weight_values
-//			,&ubulk_mask
-	);
-
-	const double L2_error = difference_per_cell.l2_norm();
-	ALLERRORS_ubulk[cycle][4] = L2_error;
-	VectorTools::integrate_difference (dof_handler_new,
-			solution_new,
-			ExactSolution<dim>(),
-			difference_per_cell,
-			q_collection,
-			VectorTools::H1_norm
-			,&weight_values
-	);
-	const double H1_error = difference_per_cell.l2_norm();
-	//    H1_norm :The square of this norm is the square of the L2_norm plus the square of the H1_seminorm.
-
-	ALLERRORS_ubulk[cycle][5] = H1_error;
-	const QTrapez<1>     q_trapez;
-	const QIterated<dim> q_iterated (q_trapez, 5);
-
-    hp::QCollection<dim>  q_iterated_collection;
-    q_iterated_collection.push_back (q_iterated);
-    q_iterated_collection.push_back (q_iterated);
-	VectorTools::integrate_difference (	dof_handler_new,
-			solution_new,
-			ExactSolution<dim>(),
-			difference_per_cell,
-			q_iterated_collection,
-			VectorTools::Linfty_norm
-			,&weight_values
-	);
-	const double Linfty_error = difference_per_cell.linfty_norm();
-	ALLERRORS_ubulk[cycle][6] = Linfty_error;
-}
-
-template <int dim>
-void PoissonProblem<dim>::interpolate_solution_usurface (){
+	 // Create the Boundary triangulation only once, but interpolate and output the interpolated
+	// usurface solution every time step.
 
 	// levelset_face_map is a map containing the angle of the point where the levelset
 	// function cuts the cell and the coordinates of the point itself.
@@ -3206,111 +3298,56 @@ void PoissonProblem<dim>::interpolate_solution_usurface (){
 	cells_data[levelset_face_map.size()-1].vertices[1] = 0;
 
 	// Create triangulation with codimension 1 and space dimension 2.
-	Triangulation<1,2> levelset_triangulation;
+//	Triangulation<1,2> levelset_triangulation;
 	levelset_triangulation.create_triangulation
 		(levelset_face_vertices_tangent, cells_data, SubCellData());
 
-	DoFHandler<1,2>      dof_handler_inside(levelset_triangulation);
-	dof_handler_inside.distribute_dofs (fe_dummy);
+//	dof_handler_us_interpol.initialize (levelset_triangulation,/*fe*/fe_dummy);
+//	DoFHandler<1,2>      dof_handler_us_interpol(levelset_triangulation);
+	dof_handler_us_interpol.distribute_dofs (fe_dummy);
+}
+
+template <int dim>
+void PoissonProblem<dim>::interpolate_solution_usurface (){
 
 	// Vector for the interpolated solution on the boundary.
-	Vector<double> solution_inside(dof_handler_inside.n_dofs());
+	Vector<double> solution_inside(dof_handler_us_interpol.n_dofs());
 	QGauss<dim-1> quadrature_formula(2);
+
+
 
 	// Interpolate the values from solution_new on the points given by the levelset triangulation.
 	std::vector<unsigned int> local_dof_indices(fe_dummy.dofs_per_cell); // dofs_per_cell = 2
 	Vector< double > interpolated_values(fe_dummy.dofs_per_cell);
 	Point<dim> point_for_interpolation;
 	for (typename DoFHandler<dim-1,dim>::active_cell_iterator
-			cell = dof_handler_inside.begin_active();
-			cell != dof_handler_inside.end(); ++cell) {
+			cell = dof_handler_us_interpol.begin_active();
+			cell != dof_handler_us_interpol.end(); ++cell) {
 //		fe_dummy_values.reinit(cell);
 		cell->get_dof_indices(local_dof_indices);
 		for (unsigned int i = 0; i<fe_dummy.dofs_per_cell; ++i) {
-			point_for_interpolation = cell->vertex(i);
-			VectorTools::point_value (dof_handler_new, solution_new, point_for_interpolation,
+			point_for_interpolation = cell->vertex(i); // Global Coord. for ith (out of 4) vertex of cell
+			VectorTools::point_value (dof_handler_new, solution, point_for_interpolation,
 					interpolated_values );
 			// Remember that dof_handler_new is vector valued: [0] for usurface, [1] for ubulk.
 			solution_inside(local_dof_indices[i]) = interpolated_values[0];
 		}
 	}
 
-	MappingQ<1, 2>   mapping_inside(1);
+	MappingQ<1,2>   mapping_inside(1);
 
-	{
-		DataOut<1,DoFHandler<1,2> > data_out;
-		data_out.attach_dof_handler (dof_handler_inside);
-		data_out.add_data_vector (solution_inside, "solution_inside",
-				DataOut<1,DoFHandler<1,2> >::type_dof_data);
-		data_out.build_patches (mapping_inside,	mapping_inside.get_degree());
+	DataOut<1,DoFHandler<1,2> > data_out;
+	data_out.attach_dof_handler (dof_handler_us_interpol);
+	data_out.add_data_vector (solution_inside, "solution_inside",
+			DataOut<1,DoFHandler<1,2> >::type_dof_data);
+	data_out.build_patches (mapping_inside,	mapping_inside.get_degree());
 
-		std::string filename ("usurface_interpolated-");
-		filename += static_cast<char>('0'+new_n_cycles);
-		filename += ".vtk";
-		std::ofstream output (filename.c_str());
-		data_out.write_vtk (output);
-	}
+	const std::string filename = "usurface_interpolated-"
+			+ Utilities::int_to_string(timestep_number, 3) +
+			".vtk";
 
-	// Create exact solution...
-	Vector<double> exact_solution_inside(dof_handler_inside.n_dofs());
-	VectorTools::interpolate(dof_handler_inside, ExactSolutionUsurface<dim>(),
-			exact_solution_inside);
-	// Create difference solution inside...
-	Vector<double> difference_solution_inside(dof_handler_inside.n_dofs());
-	difference_solution_inside += solution_inside;
-	difference_solution_inside -= exact_solution_inside;
-	// Output difference solution
-	{
-		DataOut<1,DoFHandler<1,2> > data_out;
-		data_out.attach_dof_handler (dof_handler_inside);
-		data_out.add_data_vector (difference_solution_inside, "difference_solution_inside",
-				DataOut<1,DoFHandler<1,2> >::type_dof_data);
-		data_out.build_patches (mapping_inside,	mapping_inside.get_degree());
-
-		std::string filename ("difference_solution_inside-");
-		filename += static_cast<char>('0'+new_n_cycles);
-		filename += ".vtk";
-		std::ofstream output (filename.c_str());
-		data_out.write_vtk (output);
-	}
-
-	QGauss<dim-1> quadrature_formula_error(2);
-
-	Vector<double> difference_per_cell(levelset_triangulation.n_active_cells());
-
-	// Integrate_difference function asks for an ExactSolution in <spacedim> dimensions, which is
-	// dim = 2 here
-	VectorTools::integrate_difference(
-			dof_handler_inside,  		  // dim = 1, spacedim = 2
-			solution_inside,
-			ExactSolutionUsurface<dim>(), // spacedim = 2
-			difference_per_cell,
-			quadrature_formula, 		 // dim = 1
-			VectorTools::L2_norm );
-
-	const double L2_norm = difference_per_cell.l2_norm();
-	std::cout << "L2_norm: " << L2_norm << "\n";
-
-	VectorTools::integrate_difference(
-				dof_handler_inside,  		  // dim = 1, spacedim = 2
-				solution_inside,
-				ExactSolutionUsurface<dim>(), // spacedim = 2
-				difference_per_cell,
-				quadrature_formula, 		 // dim = 1
-				VectorTools::H1_norm );
-
-	const double H1_error = difference_per_cell.l2_norm();
-	std::cout << "H1_error: " << H1_error << "\n";
-
-	const QTrapez<1>     q_trapez;
-	const QIterated<dim> q_iterated (q_trapez, 5);
-
-	ALLERRORS_usurface[cycle][0] = new_n_cycles;
-	ALLERRORS_usurface[cycle][1] = triangulation_new.n_active_cells();
-	ALLERRORS_usurface[cycle][2] = n_dofs_surface;
-
-	ALLERRORS_usurface[cycle][4] = L2_norm;
-	ALLERRORS_usurface[cycle][5] = H1_error;
+	std::ofstream output (filename.c_str());
+	data_out.write_vtk (output);
 }
 
 template <int dim>
@@ -3341,7 +3378,7 @@ void PoissonProblem<dim>::run ()
 	timestep_number = 0;
 	double time = 0;
 
-	double final_time = 0.50;
+	double final_time = .5;
 //	double final_time = 3;
 	//	int n_time_steps = final_time/time_step+1;
 	output_results();
@@ -3415,7 +3452,6 @@ void PoissonProblem<dim>::run ()
 		old_solution = solution;
 	}
 
-	//	process_solution_ubulk();
 //	interpolate_solution_usurface();
 
 }
@@ -3424,6 +3460,18 @@ void PoissonProblem<dim>::run_PureNeumannProblem ()
 {
 	cycle = 0;
 	n_cycles = 1;
+
+
+	timestep_number = 0;
+	double time = 0;
+
+	final_time = 1.25;
+	timestep_number = 0;
+	final_time = 1.25;
+	n_time_steps = std::ceil(final_time/time_step)+1;
+	mass_conservation.reinit(n_time_steps,2);
+	mass_conservation_usurface.reinit(n_time_steps,2);
+	mass_conservation_ubulk.reinit(n_time_steps,2);
 
 	make_grid (); // This will make the first grid (cycle =0) and then just refine. Updated to cycle
 	initialize_levelset();
@@ -3443,34 +3491,50 @@ void PoissonProblem<dim>::run_PureNeumannProblem ()
 ////						ZeroFunction<dim>(2),
 //			ConstantFunction<dim>(0,2),
 //			old_solution);
+
 	// If Pure Neumann...
-		old_solution.reinit (n_dofs_inside+1);
-		solution.reinit (n_dofs_inside+1);
-		solution = old_solution;
+	std::cout << "Test 1  \n";
+	old_solution.reinit (n_dofs_inside+1);
+	solution.reinit(n_dofs_inside+1);
 
-	timestep_number = 0;
-	double time = 0;
+	SetInitialCondition ();
+//	solution_new = old_solution;
+	solution	 = old_solution;
+	solution_new.block(1) = old_solution;
+//	CompMassConservation();
 
-	double final_time = 0.50;
-//	double final_time = 3;
-	//	int n_time_steps = final_time/time_step+1;
-	output_results();
+
 	// END 1st TIME STEP
 
 	// Here, the default system_matrix (A), system_rhs(F) and mass_matrix(M) are defined.
 	assemble_system_newMesh();
+
+	CompMassConservationAlternative();
+	output_results();
 
 	Vector<double> tmp (dof_handler_new.n_dofs());
 	Vector <double> tmp2 (dof_handler_new.n_dofs());
 	Vector <double> system_rhs_2 (dof_handler_new.n_dofs());
 
 	// If pure NEUMANN problem
-	FullMatrix<double> FM_mass_matrix_temp;
-	FM_mass_matrix_temp.copy_from(FM_mass_matrix);
-	FM_mass_matrix.reinit(n_dofs_inside+1,n_dofs_inside+1);
-	for (unsigned int i = 0; i<n_dofs_inside; ++i)
-		for (unsigned int j = 0; j<n_dofs_inside; ++j)
-			FM_mass_matrix(i,j) = FM_mass_matrix_temp(i+n_dofs_surface,j+n_dofs_surface);
+	{
+		FullMatrix<double> FM_mass_matrix_temp;
+		FM_mass_matrix_temp.copy_from(FM_mass_matrix);
+		FM_mass_matrix.reinit(n_dofs_inside+1,n_dofs_inside+1);
+		for (unsigned int i = 0; i<n_dofs_inside; ++i)
+			for (unsigned int j = 0; j<n_dofs_inside; ++j)
+				FM_mass_matrix(i,j) = FM_mass_matrix_temp(i+n_dofs_surface,j+n_dofs_surface);
+	}
+	{
+		FullMatrix<double> FM_mass_matrix_temp;
+		FM_mass_matrix_temp.copy_from(FM_mass_matrix_with_k_reaction);
+		FM_mass_matrix_with_k_reaction.reinit(n_dofs_inside+1,n_dofs_inside+1);
+		for (unsigned int i = 0; i<n_dofs_inside; ++i)
+			for (unsigned int j = 0; j<n_dofs_inside; ++j)
+				FM_mass_matrix_with_k_reaction(i,j)
+				= FM_mass_matrix_temp(i+n_dofs_surface,j+n_dofs_surface);
+	}
+	std::cout << "Teste 3 \n";
 
 	while (time <= final_time)
 	{
@@ -3500,15 +3564,19 @@ void PoissonProblem<dim>::run_PureNeumannProblem ()
 
 		// ASSEMBLE RHS
 		// system_rhs_2 = mass_matrix*old_solution     = M*U_n-1
-		//		mass_matrix.vmult(system_rhs_2, old_solution);
+		// mass_matrix.vmult(system_rhs_2, old_solution);
 
 		FM_mass_matrix.vmult(system_rhs_2, old_solution);
 
-		// tmp          = system_matrix*old_solution   = A*U_n-1
+//		system_matrix_aux = (A+k*M) // Adding reaction term k*M (to the RHS)
+		// k was defined in the assembly. It depends on the mesh (k = 0 for quarters 0,1,3)
+		system_matrix_aux.add(1,FM_mass_matrix_with_k_reaction);
+
+		// tmp          = system_matrix*old_solution   = U_n-1*(A+k*M)
 		system_matrix_aux.vmult(tmp, old_solution);
 
 
-		// system_rhs_2 += -(1-theta)*time_step*tmp    = M*U_n-1 - (1-theta)*time_step*A*U_n-1
+		// system_rhs_2 += -(1-theta)*time_step*tmp    = M*U_n-1 - (1-theta)*time_step*(A+k*M)*U_n-1
 		system_rhs_2.add(-(1 - theta) * time_step, tmp);
 
 		// add the forcing terms to the RHS; system_rhs is ready for solution.
@@ -3516,8 +3584,11 @@ void PoissonProblem<dim>::run_PureNeumannProblem ()
 		system_rhs_aux+=system_rhs_2;
 
 		// ASSEMBLE LHS
-		// system_matrix = A*time_step*theta
+		// system_matrix = A*time_step*theta // Without Reaction term
+		// system_matrix = (A+kM)*time_step*theta // Adding Reaction term.
 		system_matrix_aux *= time_step;
+
+
 		// Solving only UBULK in a coupled matrix.
 //		for (unsigned int i = n_dofs_surface; i<dof_handler_new.n_dofs(); ++i)
 //			for (unsigned int j = n_dofs_surface; j<dof_handler_new.n_dofs(); ++j)
@@ -3534,13 +3605,786 @@ void PoissonProblem<dim>::run_PureNeumannProblem ()
 		solve();
 		output_results();
 		old_solution = solution;
+//		CompMassConservation();
+		CompMassConservationAlternative();
+	}
+}
+
+template <int dim>
+void PoissonProblem<dim>::run_PureNeumannProblemWithoutConstraint ()
+{
+	cycle = 0;
+	n_cycles = 1;
+
+	timestep_number = 0;
+	double time = 0;
+
+	final_time = 1.25;
+	timestep_number = 0;
+	final_time = 1.25;
+	n_time_steps = std::ceil(final_time/time_step)+1;
+	mass_conservation.reinit(n_time_steps,2);
+	mass_conservation_usurface.reinit(n_time_steps,2);
+	mass_conservation_ubulk.reinit(n_time_steps,2);
+
+	make_grid (); // This will make the first grid (cycle =0) and then just refine. Updated to cycle
+	initialize_levelset();
+//	output_results_levelset();
+	get_new_triangulation ();
+
+	// SETUP 1st TIME STEP
+	setup_system_new();
+	initialize_levelset_new();
+
+	std::cout << "dim: " << dim << "\n";
+	// INITIAL CONDITION
+//	old_solution.reinit (dof_handler_new.n_dofs());
+
+
+//	VectorTools::interpolate(dof_handler_new,
+////						ZeroFunction<dim>(2),
+//			ConstantFunction<dim>(0,2),
+//			old_solution);
+
+	// If Pure Neumann...
+	old_solution.reinit (n_dofs_inside);
+	solution.reinit(n_dofs_inside);
+
+	assemble_system_newMesh();
+
+	SetInitialCondition ();
+//	solution_new = old_solution;
+	solution			 = old_solution;
+	solution_new.block(1) = old_solution;
+//	CompMassConservation();
+//	CompMassConservationAlternative();
+	CompMassConservationAlternative_2();
+	output_results();
+
+	// END 1st TIME STEP
+
+	// Here, the default system_matrix (A), system_rhs(F) and mass_matrix(M) are defined.
+
+
+	Vector<double> tmp (dof_handler_new.n_dofs());
+	Vector <double> tmp2 (dof_handler_new.n_dofs());
+	Vector <double> system_rhs_2 (dof_handler_new.n_dofs());
+
+	// If pure NEUMANN problem
+	{
+		FullMatrix<double> FM_mass_matrix_temp;
+		FM_mass_matrix_temp.copy_from(FM_mass_matrix);
+		FM_mass_matrix.reinit(n_dofs_inside,n_dofs_inside);
+		for (unsigned int i = 0; i<n_dofs_inside; ++i)
+			for (unsigned int j = 0; j<n_dofs_inside; ++j)
+				FM_mass_matrix(i,j) = FM_mass_matrix_temp(i+n_dofs_surface,j+n_dofs_surface);
+	}
+	{
+		FullMatrix<double> FM_mass_matrix_temp;
+		FM_mass_matrix_temp.copy_from(FM_mass_matrix_with_k_reaction);
+		FM_mass_matrix_with_k_reaction.reinit(n_dofs_inside,n_dofs_inside);
+		for (unsigned int i = 0; i<n_dofs_inside; ++i)
+			for (unsigned int j = 0; j<n_dofs_inside; ++j)
+				FM_mass_matrix_with_k_reaction(i,j)
+				= FM_mass_matrix_temp(i+n_dofs_surface,j+n_dofs_surface);
+	}
+	std::cout << "Teste 3 \n";
+
+	while (time <= final_time)
+	{
+		time += time_step;
+		++timestep_number;
+
+		std::cout << "Time step " << timestep_number << " at t=" << time
+				<< std::endl;
+
+		// Using aux matrices (A,F,M) makes it easier to manipulate the time-dependent equation.
+		// Note that the original (A,F,M) matrices are computed only once, making it much faster
+		// than calling assemble_system_newMesh every time; remember that if one wants to assemble
+		// them every time step, it is absolutely necessary to reinit (A,F,M) matrices (just as the
+		// aux matrices are being reinit below), because they are being changed in the calculation
+		// below. Also, now the solve() function is solving the aux matrices.
+
+		// Solving only UBULK, pure Neumann problem:
+		tmp.reinit (n_dofs_inside);
+		tmp2.reinit (n_dofs_inside);
+		system_rhs_2.reinit (n_dofs_inside);
+
+		system_matrix_aux.reinit(n_dofs_inside,n_dofs_inside);
+		system_matrix_aux.copy_from(FM_system_matrix_block11_yes_j);
+		system_rhs_aux.reinit(n_dofs_inside);
+		system_rhs_aux = system_rhs_block1;
+
+
+		// ASSEMBLE RHS
+		// system_rhs_2 = mass_matrix*old_solution     = M*U_n-1
+		// mass_matrix.vmult(system_rhs_2, old_solution);
+
+		FM_mass_matrix.vmult(system_rhs_2, old_solution);
+
+//		system_matrix_aux = (A+k*M) // Adding reaction term k*M (to the RHS)
+		// k was defined in the assembly. It depends on the mesh (k = 0 for quarters 0,1,3)
+		system_matrix_aux.add(1,FM_mass_matrix_with_k_reaction);
+
+		// tmp          = system_matrix*old_solution   = U_n-1*(A+k*M)
+		system_matrix_aux.vmult(tmp, old_solution);
+
+
+		// system_rhs_2 += -(1-theta)*time_step*tmp    = M*U_n-1 - (1-theta)*time_step*(A+k*M)*U_n-1
+		system_rhs_2.add(-(1 - theta) * time_step, tmp);
+
+		// add the forcing terms to the RHS; system_rhs is ready for solution.
+		system_rhs_aux *= time_step;
+		system_rhs_aux +=system_rhs_2;
+
+		// ASSEMBLE LHS
+		// system_matrix = A*time_step*theta // Without Reaction term
+		// system_matrix = (A+kM)*time_step*theta // Adding Reaction term.
+		system_matrix_aux *= time_step;
+
+
+		// Solving only UBULK in a coupled matrix.
+//		for (unsigned int i = n_dofs_surface; i<dof_handler_new.n_dofs(); ++i)
+//			for (unsigned int j = n_dofs_surface; j<dof_handler_new.n_dofs(); ++j)
+//				system_matrix_aux(i,j) *= theta;
+		// Solving PURE NEUMANN problem
+		system_matrix_aux *= theta;
+
+		// system_matrix = M+A*time_step*theta
+		//		system_matrix_aux.add(1,mass_matrix);
+		system_matrix_aux.add(1,FM_mass_matrix);
+
+		std::cout << "Time step # " << timestep_number << " at t=" << time
+				<< std::endl;
+		solve();
+		output_results();
+		old_solution = solution;
+//		CompMassConservation();
+//		CompMassConservationAlternative();
+		CompMassConservationAlternative_2();
+	}
+}
+
+template <int dim>
+void PoissonProblem<dim>::run_CoupledReaction ()
+{
+	cycle = 0;
+	n_cycles = 1;
+
+	make_grid (); // This will make the first grid (cycle =0) and then just refine. Updated to cycle
+	initialize_levelset();
+	output_results_levelset();
+	get_new_triangulation ();
+
+	// SETUP 1st TIME STEP
+	setup_system_new();
+	initialize_levelset_new();
+
+
+	std::cout << "dim: " << dim << "\n";
+	// INITIAL CONDITION
+	old_solution.reinit (dof_handler_new.n_dofs());
+
+	timestep_number = 0;
+	double time = 0;
+	final_time = 1.25;
+	n_time_steps = std::ceil(final_time/time_step)+1;
+	mass_conservation.reinit(n_time_steps,2);
+	mass_conservation_usurface.reinit(n_time_steps,2);
+	mass_conservation_ubulk.reinit(n_time_steps,2);
+
+	std::cout << "n_time_steps : " << n_time_steps << std::endl;
+
+	SetInitialCondition();
+
+	solution_new = old_solution;
+	solution	 = old_solution;
+	CompMassConservation();
+	output_results();
+
+//	VectorTools::interpolate(dof_handler_new,
+//						ZeroFunction<dim>(2),
+////			ConstantFunction<dim>(0,2),
+//			old_solution);
+
+	// END 1st TIME STEP
+
+	// Here, the default system_matrix (A), system_rhs(F) and mass_matrix(M) are defined.
+	assemble_system_newMesh();
+
+	Vector<double> tmp;
+	Vector <double> tmp2;
+	Vector <double> system_rhs_2;
+
+	Vector<double> old_solution_n_1(dof_handler_new.n_dofs());
+	make_grid_interpolated();
+	while (time <= final_time)
+	{
+		time += time_step;
+		++timestep_number;
+		std::cout << "Time step " << timestep_number << " at t=" << time
+				<< std::endl;
+
+		// Using aux matrices (A,F,M) makes it easier to manipulate the time-dependent equation.
+		// Note that the original (A,F,M) matrices are computed only once, making it much faster
+		// than calling assemble_system_newMesh every time; remember that if one wants to assemble
+		// them every time step, it is absolutely necessary to reinit (A,F,M) matrices (just as the
+		// aux matrices are being reinit below), because they are being changed in the calculation
+		// below. Also, now the solve() function is solving the aux matrices.
+
+		// Solving only UBULK, pure Neumann problem:
+		tmp.reinit (dof_handler_new.n_dofs());
+		tmp2.reinit (dof_handler_new.n_dofs());
+		system_rhs_2.reinit (dof_handler_new.n_dofs());
+
+
+		system_matrix_aux.reinit(dof_handler_new.n_dofs(),dof_handler_new.n_dofs());
+		// system_matrix_aux = A
+		system_matrix_aux.copy_from(FM_system_matrix_block_yes_j_no_constraint);
+		// Multiply Laplace (A) matrix by the diffusion constant. Assuming same constant for both equations.
+//		system_matrix_aux*=diffusion_constant;
+
+		system_rhs_aux.reinit(dof_handler_new.n_dofs());
+		// system_rhs_aux = F+N
+		system_rhs_aux = system_rhs_new;
+
+		// ASSEMBLE RHS
+
+		// mass_matrix.vmult(system_rhs_2, old_solution);
+
+		// system_rhs_2 = mass_matrix*old_solution     = M*U_n-1
+		FM_mass_matrix.vmult(system_rhs_2, old_solution);
+
+		// system_rhs_aux (part usurface) = \int k u_B
+
+		// system_rhs_aux = [kC (F+N)]^T
+		CompInterpolatedBulkSolution(old_solution_n_1);
+		for (unsigned int i = 0; i<n_dofs_surface; ++i)
+			system_rhs_aux(i) += rhs_kc_usurface(i);
+
+		// FM_mass_matrix_with_k_reaction = [[0 0];[0 kM]]
+		for (unsigned int i = 0; i<n_dofs_surface; ++i)
+			for (unsigned int j = 0; j<n_dofs_surface; ++j)
+				FM_mass_matrix_with_k_reaction(i,j) = 0;
+
+		//	system_matrix_aux[0,0] = (A+0) // Adding reaction term k*M (to the RHS) // Equation UBULK
+		//	system_matrix_aux[1,1] = (A+k*M) // Adding reaction term k*M (to the RHS) // Equation UBULK
+		// k was defined in the assembly. It depends on the mesh (k = 0 for quarters 0,1,3)
+		system_matrix_aux.add(1,FM_mass_matrix_with_k_reaction);
+
+		// tmp          = system_matrix*old_solution   = U_n-1*(A+k*M)
+		// tmp[0,0] = U_n-1*(A)
+		// tmp[1,1] = U_n-1*(A+kM)
+		system_matrix_aux.vmult(tmp, old_solution);
+
+
+		// system_rhs_2 	 = system_rhs_2 - (1-theta)*time_step   * tmp
+		// system_rhs_2[0,0] = M*U_n-1      - (1-theta)*time_step   * (A    )*U_n-1
+		// system_rhs_2[1,1] = M*U_n-1      - (1-theta)*time_step   * (A+k*M)*U_n-1
+		system_rhs_2.add(				    -(1 - theta) * time_step, tmp);
+
+		// add the forcing terms to the RHS; system_rhs is ready for solution.
+		// system_rhs_aux = [kC (F+N)]^T * time_step
+		system_rhs_aux*= time_step;
+		system_rhs_aux+=system_rhs_2;
+
+		// ASSEMBLE LHS
+		// system_matrix = A*time_step*theta // Without Reaction term
+
+		// system_matrix[0,0] = (A)*time_step*theta // Adding Reaction term.
+		// system_matrix[1,1] = (A+kM)*time_step*theta // Adding Reaction term.
+		system_matrix_aux *= time_step*theta;;
+
+
+		// Solving only UBULK in a coupled matrix.
+//		for (unsigned int i = n_dofs_surface; i<dof_handler_new.n_dofs(); ++i)
+//			for (unsigned int j = n_dofs_surface; j<dof_handler_new.n_dofs(); ++j)
+//				system_matrix_aux(i,j) *= theta;
+		// Solving PURE NEUMANN problem
+
+		// system_matrix[0,0] = M+(A)*time_step*theta // Adding Reaction term.
+		// system_matrix[1,1] = M+(A+kM)*time_step*theta // Adding Reaction term.
+		system_matrix_aux.add(1,FM_mass_matrix);
+
+		solve();
+		output_results();
+		interpolate_solution_usurface();
+		old_solution_n_1 = old_solution;
+		old_solution = solution;
+		CompMassConservation();
 	}
 
-	//	process_solution_ubulk();
 //	interpolate_solution_usurface();
 
 }
 
+template <int dim>
+void PoissonProblem<dim>::CompMassConservation ()
+{
+	std::cout << "Call to  CompMassConservation @ timestep_number = " << timestep_number << std::endl;
+
+	// timestep_number begins at 0, which corresponds to time = 0.
+	mass_conservation(timestep_number,0) = timestep_number*time_step;
+	mass_conservation_usurface(timestep_number,0) = timestep_number*time_step;
+	mass_conservation_ubulk(timestep_number,0) = timestep_number*time_step;
+
+	// Should never sum extra term Lagr. Multip.
+	// Uncomment if coupled problem
+	for (unsigned int i = 0; i</*n_dofs_surface+*/ n_dofs_inside; ++i)
+	{
+		mass_conservation(timestep_number,1) += solution(i);
+	}
+
+	// Uncomment if coupled problem
+//	for (unsigned int i = 0; i<n_dofs_surface; ++i)
+//	{
+//		mass_conservation_usurface(timestep_number,1) += solution(i);
+//	}
+
+//	mass_conservation_usurface(timestep_number,1)+=-10000.0;
+//	mass_conservation_usurface(timestep_number,1)*=100.0/10000.0;
+
+
+	for (unsigned int i = 0; i<n_dofs_inside; ++i)
+	{
+		mass_conservation_ubulk(timestep_number,1) += solution(i/*+n_dofs_surface*/);
+		// Uncomment if coupled problem
+	}
+	mass_conservation_ubulk(timestep_number,1)+=-10000.0;
+	mass_conservation_ubulk(timestep_number,1)*=100.0/10000.0;
+
+	mass_conservation(timestep_number,1)+=-10000.0;
+	mass_conservation(timestep_number,1)*=100.0/10000.0;
+
+	if (timestep_number+1 == n_time_steps)
+	{
+		std::ofstream MASS_CONSERVATION_USURFACE;
+		MASS_CONSERVATION_USURFACE.open("mass_conservation_usurface.txt");
+
+		std::ofstream MASS_CONSERVATION_UBULK;
+		MASS_CONSERVATION_UBULK.open("mass_conservation_ubulk.txt");
+		assert ( (mass_conservation_usurface.size(0) == mass_conservation_ubulk.size(0))
+				&&
+				(mass_conservation_usurface.size(1) == mass_conservation_ubulk.size(1)));
+
+		for(int unsigned i = 0; i < mass_conservation_usurface.size(0); ++i) {
+			for(int unsigned j = 0; j < mass_conservation_usurface.size(1); ++j) {
+				MASS_CONSERVATION_USURFACE 	<< mass_conservation_usurface(i,j) << ' ';
+				MASS_CONSERVATION_UBULK 	<< mass_conservation_ubulk(i,j) << ' ';
+			}
+			MASS_CONSERVATION_USURFACE << std::endl;
+			MASS_CONSERVATION_UBULK << std::endl;
+		}
+		MASS_CONSERVATION_USURFACE.close();
+		MASS_CONSERVATION_UBULK.close();
+
+		std::ofstream MASS_CONSERVATION;
+		MASS_CONSERVATION.open("mass_conservation.txt");
+
+		for(int unsigned i = 0; i < mass_conservation.size(0); ++i) {
+			for(int unsigned j = 0; j < mass_conservation.size(1); ++j) {
+				MASS_CONSERVATION 	<< mass_conservation(i,j) << ' ';
+			}
+			MASS_CONSERVATION << std::endl;
+		}
+		MASS_CONSERVATION.close();
+	}
+}
+
+template <int dim>
+void PoissonProblem<dim>::CompMassConservationAlternative ()
+{
+
+	std::cout << "Call to CompMassConservationAlternative \n";
+	QGauss<dim>  quadrature_formula(2);
+	QGauss<1> face_quadrature_formula(2);
+
+	hp::QCollection<dim>  q_collection;
+	q_collection.push_back (quadrature_formula);
+	q_collection.push_back (quadrature_formula);
+
+	hp::FEValues<dim> 	 hp_fe_values (fe_collection_surface,
+			q_collection ,
+			update_values | update_gradients | update_JxW_values
+			| update_quadrature_points | update_jacobians | update_support_jacobians
+			| update_inverse_jacobians);
+
+//	int count_cell = 0;
+	int dofs_per_cell;
+
+	std::vector<Point<dim> > support_points(dof_handler_new.n_dofs());
+	DoFTools::map_dofs_to_support_points(mapping_collection_surface, dof_handler_new, support_points);
+	std::vector<types::global_dof_index> cell_global_dof_indices;
+
+	double total_sum_over_elements;
+
+	const FEValuesExtractors::Scalar usurface (0);
+	const FEValuesExtractors::Scalar ubulk 	  (1);
+	const unsigned int   n_q_points    = quadrature_formula.size();
+
+	for (typename hp::DoFHandler<dim>::active_cell_iterator
+			cell = dof_handler_new.begin_active();
+			cell != dof_handler_new.end(); ++cell)
+
+	{
+		int active_fe_index = cell->active_fe_index();
+		dofs_per_cell = cell->get_fe(	).dofs_per_cell;
+		hp_fe_values.reinit (cell);
+		const FEValues<dim> &fe_values = hp_fe_values.get_present_fe_values();
+		cell_global_dof_indices.resize(dofs_per_cell);
+		cell->get_dof_indices(cell_global_dof_indices);
+
+		for (unsigned int q_point=0; q_point<n_q_points; ++q_point) {
+			for (unsigned int i=0; i<dofs_per_cell; ++i) {
+				if (cell_is_in_surface_domain(cell))
+					if (dof_handler_new.get_fe()[active_fe_index].system_to_component_index(i).first == 1)
+					{
+						total_sum_over_elements += solution_new[cell_global_dof_indices[i]]
+						                                        *fe_values[ubulk].value(i,q_point)
+																*fe_values.JxW(q_point);
+					}
+				if (cell_is_in_bulk_domain(cell))
+					total_sum_over_elements += solution_new[cell_global_dof_indices[i]]
+					                                        *fe_values.shape_value(i,q_point)
+					                                        *fe_values.JxW(q_point);
+			}
+		}
+	}
+
+//	if(timestep_number == 0)
+//		double reference_sum = total_sum_over_elements;
+
+	mass_conservation_ubulk(timestep_number,0)	= timestep_number*time_step;
+	mass_conservation_ubulk(timestep_number,1) 	= total_sum_over_elements;
+
+	if (timestep_number == 0)
+		maximum_cell_integration = total_sum_over_elements;
+
+	mass_conservation_ubulk(timestep_number,1)+=-maximum_cell_integration;
+	mass_conservation_ubulk(timestep_number,1)*=100.0/maximum_cell_integration;
+
+	std::ofstream MASS_CONSERVATION;
+	MASS_CONSERVATION.open("mass_conservation_ubulk_alternative.txt");
+
+	for(int unsigned i = 0; i < mass_conservation_ubulk.size(0); ++i) {
+		for(int unsigned j = 0; j < mass_conservation_ubulk.size(1); ++j) {
+			MASS_CONSERVATION 	<< mass_conservation_ubulk(i,j) << ' ';
+		}
+		MASS_CONSERVATION << std::endl;
+	}
+	MASS_CONSERVATION.close();
+}
+
+template <int dim>
+void PoissonProblem<dim>::CompMassConservationAlternative_2 ()
+{
+
+	std::cout << "Call to CompMassConservationAlternative_2 \n";
+	QGauss<dim>  quadrature_formula(2);
+	QGauss<1> face_quadrature_formula(2);
+
+	hp::QCollection<dim>  q_collection;
+	q_collection.push_back (quadrature_formula);
+	q_collection.push_back (quadrature_formula);
+
+	hp::FEValues<dim> 	 hp_fe_values (fe_collection_surface,
+			q_collection ,
+			update_values | update_gradients | update_JxW_values
+			| update_quadrature_points | update_jacobians | update_support_jacobians
+			| update_inverse_jacobians);
+
+	int count_cell = 0;
+	int dofs_per_cell;
+
+	std::vector<Point<dim> > support_points(dof_handler_new.n_dofs());
+	DoFTools::map_dofs_to_support_points(mapping_collection_surface, dof_handler_new, support_points);
+	std::vector<types::global_dof_index> cell_global_dof_indices;
+
+	double total_sum_over_elements;
+
+	const FEValuesExtractors::Scalar usurface (0);
+	const FEValuesExtractors::Scalar ubulk 	  (1);
+	const unsigned int   n_q_points    = quadrature_formula.size();
+
+	for (typename hp::DoFHandler<dim>::active_cell_iterator
+			cell = dof_handler_new.begin_active();
+			cell != dof_handler_new.end(); ++cell)
+
+	{
+		int active_fe_index = cell->active_fe_index();
+		dofs_per_cell = cell->get_fe(	).dofs_per_cell;
+		hp_fe_values.reinit (cell);
+		const FEValues<dim> &fe_values = hp_fe_values.get_present_fe_values();
+		cell_global_dof_indices.resize(dofs_per_cell);
+		cell->get_dof_indices(cell_global_dof_indices);
+		std::vector<double> nodal_values(4);
+		if (cell_is_in_surface_domain(cell)) {
+
+			cut_cell_integration Obj_cut_cell_integration
+			(fe_values,/*fe*/FE_Q<2>(1),quadrature_formula,face_quadrature_formula);
+
+			// Compute integral over whole Cut cell: need to integrate over all faces using
+			// divergence theorem method. This part is ok: when the problem is only diffusion with
+			// no flux at the boundary (homogeneous Neumann) the mass is conserved
+			int count_ubulk_nodes = 0;
+			for (unsigned int i=0; i<dofs_per_cell; ++i)
+			{
+				// Get only solution values of the ubulk solution
+				// Here, I want access global dof of ubulk
+				if (dof_handler_new.get_fe()[active_fe_index].system_to_component_index(i).first == 1)
+				{
+					nodal_values[count_ubulk_nodes]
+					             = solution_new[cell_global_dof_indices[i]];
+					++count_ubulk_nodes;
+				}
+			}
+
+			for (int face = 0; face<CutTriangulation[count_cell].number_of_faces; ++face)
+			{
+				Point<2> X0 = CutTriangulation[count_cell].Obj_VectorNewFace[face].X0;
+				Point<2> X1 = CutTriangulation[count_cell].Obj_VectorNewFace[face].X1;
+				X0 = mapping.transform_real_to_unit_cell(cell,X0);
+				X1 = mapping.transform_real_to_unit_cell(cell,X1);
+
+				Point<2> normal_vector =
+						CutTriangulation[count_cell].Obj_VectorNewFace[face].normal_vector;
+				double unit_face_length =
+						CutTriangulation[count_cell].Obj_VectorNewFace[face].unit_face_length;
+
+				for (unsigned int i=0; i<dofs_per_cell; ++i) {
+					if (dof_handler_new.get_fe()[active_fe_index].system_to_component_index(i).first == 1)
+					{
+						int dof_index_i = dof_handler_new.get_fe()[active_fe_index].
+								system_to_component_index(i).second;
+						double face_integration = Obj_cut_cell_integration.
+						CompMassConservation_face (X0,X1, normal_vector, dof_index_i,
+								unit_face_length, nodal_values);
+//						std::cout << "face_integration: " << face_integration << std::endl;
+						total_sum_over_elements += face_integration;
+					}
+				}
+			}
+		} // end cell is in surface domain
+				if (cell_is_in_bulk_domain(cell))
+					for (unsigned int i=0; i<dofs_per_cell; ++i)
+						for (unsigned int q_point=0; q_point<n_q_points; ++q_point)
+					total_sum_over_elements += solution_new[cell_global_dof_indices[i]]
+					                                        *fe_values.shape_value(i,q_point)
+					                                        *fe_values.JxW(q_point);
+
+//				std::cout << "count_cell: " << count_cell << std::endl;
+				++count_cell;
+	}
+
+//	if(timestep_number == 0)
+//		double reference_sum = total_sum_over_elements;
+
+	mass_conservation_ubulk(timestep_number,0)	= timestep_number*time_step;
+	mass_conservation_ubulk(timestep_number,1) 	= total_sum_over_elements;
+
+	if (timestep_number == 0)
+		maximum_cell_integration = total_sum_over_elements;
+
+	mass_conservation_ubulk(timestep_number,1)+=-maximum_cell_integration;
+	mass_conservation_ubulk(timestep_number,1)*=100.0/maximum_cell_integration;
+
+	std::ofstream MASS_CONSERVATION;
+	MASS_CONSERVATION.open("mass_conservation_ubulk_alternative.txt");
+
+	for(int unsigned i = 0; i < mass_conservation_ubulk.size(0); ++i) {
+		for(int unsigned j = 0; j < mass_conservation_ubulk.size(1); ++j) {
+			MASS_CONSERVATION 	<< mass_conservation_ubulk(i,j) << ' ';
+		}
+		MASS_CONSERVATION << std::endl;
+	}
+	MASS_CONSERVATION.close();
+
+}
+
+
+
+template <int dim>
+void PoissonProblem<dim>::SetInitialCondition ()
+{
+	// Set IC to zero in all DOF's (or a constant function)
+//	VectorTools::interpolate(dof_handler_new,
+//						ZeroFunction<dim>(2),
+////			ConstantFunction<dim>(0,2), // If one wants to interpolate only [ubulk] part of old_solution.
+//			old_solution);
+
+	std::vector<Point<dim> > support_points(dof_handler_new.n_dofs());
+	DoFTools::map_dofs_to_support_points(mapping_collection_surface, dof_handler_new, support_points);
+	std::vector<types::global_dof_index> cell_global_dof_indices;
+	int dofs_per_cell;
+	Point<2> center (0,0);
+
+	for (typename hp::DoFHandler<dim>::active_cell_iterator
+			cell  = dof_handler_new.begin_active();
+			cell != dof_handler_new.end(); ++cell)
+	{
+		dofs_per_cell = cell->get_fe().dofs_per_cell;
+		cell_global_dof_indices.resize(dofs_per_cell);
+		cell->get_dof_indices(cell_global_dof_indices);
+
+		for (unsigned int i = 0; i<dofs_per_cell; ++i)
+			if (support_points[cell_global_dof_indices[i]].distance(center) <= /*4**/cell->diameter()) // Global Coord. for ith (out of 4) vertex of cell
+			{
+				old_solution[cell_global_dof_indices[i]-n_dofs_surface] = 10000.0/9.0;
+			}
+	}
+}
+
+
+template <int dim>
+void PoissonProblem<dim>::CompInterpolatedBulkSolution (Vector<double> &old_solution_n_1)
+{
+	std::cout << "Call to CompInterpolatedBulkSolution \n";
+	QGauss<dim>  quadrature_formula(2);
+	QGauss<1> face_quadrature_formula(2);
+
+	hp::QCollection<dim>  q_collection;
+	q_collection.push_back (quadrature_formula);
+	q_collection.push_back (quadrature_formula);
+
+	hp::FEValues<dim> 	 hp_fe_values (fe_collection_surface,
+			q_collection ,
+			update_values | update_gradients | update_JxW_values
+			| update_quadrature_points | update_jacobians | update_support_jacobians
+			| update_inverse_jacobians);
+	int count_cell = 0;
+	int dofs_per_cell;
+
+	std::vector<Point<dim> > support_points(dof_handler_new.n_dofs());
+	DoFTools::map_dofs_to_support_points(mapping_collection_surface, dof_handler_new, support_points);
+	std::vector<types::global_dof_index> cell_global_dof_indices;
+
+	/*FullMatrix*/Vector <double> cell_kc_matrix;
+	Vector<double> average_solution_ubulk(dof_handler_new.n_dofs());
+	Vector<double> cell_matrix_average_solution_ubulk;
+	rhs_kc_usurface.reinit(dof_handler_new.n_dofs());
+
+	double k_reaction;
+
+	for (typename hp::DoFHandler<dim>::active_cell_iterator
+			cell = dof_handler_new.begin_active();
+			cell != dof_handler_new.end(); ++cell)
+
+	{
+		int active_fe_index = cell->active_fe_index();
+		dofs_per_cell = cell->get_fe(	).dofs_per_cell;
+		cell_kc_matrix.reinit(dofs_per_cell/*,dofs_per_cell*/);
+		cell_matrix_average_solution_ubulk.reinit(dofs_per_cell);
+		if (cell_is_in_surface_domain(cell))
+		{
+			assert(active_fe_index == 0);
+			cell_global_dof_indices.resize(dofs_per_cell);
+			cell->get_dof_indices(cell_global_dof_indices);
+
+			hp_fe_values.reinit (cell);
+			const FEValues<dim> &fe_values = hp_fe_values.get_present_fe_values();
+
+
+			Point<2> X0_RealCell = CutTriangulation[count_cell].X0_CutFace;
+			Point<2> X1_RealCell = CutTriangulation[count_cell].X1_CutFace;
+			Point<2> X0_UnitCell = mapping.transform_real_to_unit_cell(cell,X0_RealCell);
+			Point<2> X1_UnitCell = mapping.transform_real_to_unit_cell(cell,X1_RealCell);
+			double real_face_length = CutTriangulation[count_cell].real_face_length_CutFace;
+
+			if( (X0_RealCell[0]<=0 && X1_RealCell[0]<=0) && (X0_RealCell[1]<=0 && X1_RealCell[1]<=0) )
+				k_reaction = k_reaction_quarter_2;
+			else k_reaction = 0.0;
+
+			std::vector<double> nodal_values(4);
+
+			cut_cell_integration Obj_cut_cell_integration
+			(fe_values,/*fe*/FE_Q<2>(1),quadrature_formula,face_quadrature_formula);
+//			std::vector<Point<dim> > support_points_cell = cell->get_fe().get_generalized_support_points;
+			int count_ubulk_nodes = 0;
+			for (unsigned int i=0; i<dofs_per_cell; ++i)
+			{
+				// Get only solution values of the ubulk solution
+				// Here, I want access global dof of ubulk
+				if (dof_handler_new.get_fe()[active_fe_index].system_to_component_index(i).first == 1)
+				{
+					nodal_values[count_ubulk_nodes]
+					             = solution[cell_global_dof_indices[i]]*(1-theta)+
+					             old_solution_n_1[cell_global_dof_indices[i]]*theta;
+					++count_ubulk_nodes;
+				}
+				cell_matrix_average_solution_ubulk[i]
+				                 = solution[cell_global_dof_indices[i]]*(1-theta)+
+				                 old_solution_n_1[cell_global_dof_indices[i]]*theta;
+			}
+
+			for (unsigned int i=0; i<dofs_per_cell; ++i) {
+				//				for (unsigned int j=0; j<dofs_per_cell; ++j)
+				// Here, I want access global dof of usurface
+				if (dof_handler_new.get_fe()[active_fe_index].system_to_component_index(i).first == 0)
+//					if (dof_handler_new.get_fe()[active_fe_index].system_to_component_index(j).first == 0)
+					{
+						int dof_index_i = dof_handler_new.get_fe()[active_fe_index].
+								system_to_component_index(i).second;
+						cell_kc_matrix(i) += k_reaction*
+								Obj_cut_cell_integration.CompMatrix_kC
+								(X0_UnitCell, X1_UnitCell, dof_index_i,nodal_values,real_face_length);
+					}
+				//					std::cout << cell_kc_matrix(i,j) << "\n";
+			}
+
+
+			for (unsigned int i=0; i<dofs_per_cell; ++i)
+				rhs_kc_usurface(cell_global_dof_indices[i]) += cell_kc_matrix(i);
+
+			for (unsigned int i=0; i<dofs_per_cell; ++i)
+				average_solution_ubulk(cell_global_dof_indices[i])
+				/*+*/= cell_matrix_average_solution_ubulk(i);
+		}// end if is surface cell
+		++count_cell; // Have to count all cells, not only surface cells
+	} // end loop cells
+	// Output the averaged (or not) solution for visualization purposes
+	output_UbulkInterpolatedResults(average_solution_ubulk);
+
+/*	{
+		std::ofstream FM_SYSTEM_MATRIX;
+		FM_SYSTEM_MATRIX.open("rhs_kc_usurface.txt");
+		for(int unsigned i = 0; i < rhs_kc_usurface.size(0); ++i) {
+			for(int unsigned j = 0; j < rhs_kc_usurface.size(1); ++j) {
+				FM_SYSTEM_MATRIX << rhs_kc_usurface(i,j) << ',';
+			}
+			FM_SYSTEM_MATRIX << std::endl;
+		}
+		FM_SYSTEM_MATRIX.close();
+	}  */
+}
+
+template <int dim>
+void PoissonProblem<dim>::output_UbulkInterpolatedResults (Vector<double> &average_solution_ubulk)
+{
+	std::vector<std::string> solution_names;
+	solution_names.push_back ("USURFACE");
+	solution_names.push_back ("UBULK");
+
+	std::vector<DataComponentInterpretation::DataComponentInterpretation>
+	data_component_interpretation
+	(2, DataComponentInterpretation::component_is_scalar);
+
+	DataOut<dim,hp::DoFHandler<dim> > data_out_surface;
+	data_out_surface.attach_dof_handler (dof_handler_new);
+	data_out_surface.add_data_vector (average_solution_ubulk, solution_names,
+			DataOut<dim,hp::DoFHandler<dim> >::type_dof_data,
+			data_component_interpretation);
+
+	//    	data_out_surface.add_data_vector (solution_block1, "USURFACE");
+	data_out_surface.build_patches ();
+
+
+	const std::string filename = "average_solution_ubulk-"
+			+ Utilities::int_to_string(timestep_number, 3) +
+			".vtk";
+
+	std::ofstream output_new(filename.c_str());
+	data_out_surface.write_vtk(output_new);
+}
 
 } // End namespace
 
@@ -3557,9 +4401,17 @@ int main ()
 		// Run coupled problem, or mixed problem, but only one equation constrained.
 		// Runs also Pure Neumann problem without constraints (sol. from -2.5 to 2.5 - equal
 		// to constraining the mean value over all cells in the domain)
-		Obj_PoissonProblem.run ();
+//		Obj_PoissonProblem.run ();
 		// Run the Pure Neumann problem with constraints applied on the (cut) boundary.
+
+		// Run PureNeumann WITH CONSTRAINT
 //		Obj_PoissonProblem.run_PureNeumannProblem();
+
+//		Obj_PoissonProblem.run_CoupledReaction();
+
+		// Run PureNeumann WITH CONSTRAINT
+//		Obj_PoissonProblem.run_PureNeumannProblem();
+		Obj_PoissonProblem.run_PureNeumannProblemWithoutConstraint();
 //	}
 
 	return 0;
